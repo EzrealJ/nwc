@@ -1,0 +1,16 @@
+[package]
+name = "nwc-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+aes-gcm = "0.10"
+scrypt = { version = "0.11", default-features = false, features = ["std"] }
+sha2 = "0.10"
+base64 = "0.22"
+regex = "1"
+# 0.3 在 windows-gnu 上用 raw-dylib 引 bcryptprimitives，需要自备 as.exe 的 dlltool；
+# 0.2 走普通导入库，兼容 rustup 的 self-contained GNU 工具链
+getrandom = "0.2"

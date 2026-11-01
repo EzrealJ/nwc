@@ -1,0 +1,16 @@
+[package]
+name = "nwc-mac"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "nwc-mac"
+path = "src/main.rs"
+
+[dependencies]
+nwc-core = { path = "../nwc-core" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSStatusItem", "NSMenu", "NSPasteboard", "NSImage", "NSRunningApplication", "NSWorkspace"] }
+objc2-foundation = { version = "0.3", features = ["NSString", "NSArray", "NSURL", "NSPathUtilities", "NSNotification", "NSThread"] }
