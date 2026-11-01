@@ -1,0 +1,86 @@
+# 发布工作流：推 v* 标签自动构建并发 Release；也可在 Actions 页手动触发
+# 产物：win-x64 / macos-arm64 / macos-x64（Linux 暂无壳，见 README）
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '发布标签（如 v0.1.1；不存在时在 main HEAD 上创建）'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-win:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p nwc-core
+      - run: cargo build --release -p nwc-win
+      - name: 打包
+        shell: bash
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then TAG="${INPUT_TAG:?}"; else TAG="$GITHUB_REF_NAME"; fi
+          mkdir -p dist
+          tar -a -cf "dist/NetWorkClipboard-$TAG-win-x64.zip" -C target/release nwc.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: win-x64
+          path: dist/*.zip
+          if-no-files-found: error
+
+  build-mac:
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            arch: arm64
+          - target: x86_64-apple-darwin
+            arch: x64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo test -p nwc-core
+      - run: cargo build --release -p nwc-mac --target ${{ matrix.target }}
+      - name: 打包
+        shell: bash
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then TAG="${INPUT_TAG:?}"; else TAG="$GITHUB_REF_NAME"; fi
+          mkdir -p dist
+          tar -a -cf "dist/NetWorkClipboard-$TAG-macos-${{ matrix.arch }}.zip" -C "target/${{ matrix.target }}/release" nwc-mac
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: dist/*.zip
+          if-no-files-found: error
+
+  release:
+    needs: [build-win, build-mac]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: 创建 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then TAG="${INPUT_TAG:?}"; else TAG="$GITHUB_REF_NAME"; fi
+          ls -l dist
+          gh release create "$TAG" dist/*.zip \
+            --title "NetWorkClipboard $TAG" \
+            --generate-notes

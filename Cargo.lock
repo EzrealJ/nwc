@@ -278,7 +278,7 @@ dependencies = [
 
 [[package]]
 name = "nwc-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aes-gcm",
  "base64",
@@ -292,7 +292,7 @@ dependencies = [
 
 [[package]]
 name = "nwc-mac"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "nwc-core",
  "objc2",
@@ -302,7 +302,7 @@ dependencies = [
 
 [[package]]
 name = "nwc-win"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "nwc-core",
  "png",
