@@ -142,6 +142,8 @@ pub fn open_settings(mtm: MainThreadMarker, cfg_path: PathBuf) {
         window.setShowsResizeIndicator(false);
 
         let view = window.contentView().unwrap();
+        // AppKit 默认坐标系原点在左下角（y 向上增长）：按“从上往下”排版时统一翻转
+        let content_h = view.frame().size.height;
 
         // 当前值：默认 < config.json
         let cur = read_current(&cfg_path);
@@ -152,7 +154,8 @@ pub fn open_settings(mtm: MainThreadMarker, cfg_path: PathBuf) {
         let x2 = PAD + half + 16.0;
 
         let mut place = |v: &AnyObject, x: f64, yy: f64, w: f64, h: f64| {
-            let _: () = msg_send![v, setFrame: rect(x, yy, w, h)];
+            let flipped_y = content_h - yy - h;
+            let _: () = msg_send![v, setFrame: rect(x, flipped_y, w, h)];
             let _: () = msg_send![&*view, addSubview: v];
         };
 
