@@ -85,6 +85,25 @@ define_class! {
             let _ = std::process::Command::new("open").arg(&dir).spawn();
         }
 
+        /// 清空收件箱：osascript 确认框在后台线程等待（不能阻塞主线程 AppKit）
+        #[unsafe(method(clearInbox:))]
+        unsafe fn clear_inbox(&self, _sender: *mut AnyObject) {
+            let tx = self.ivars().cmd_tx.clone();
+            std::thread::Builder::new()
+                .name("nwc-clear-inbox".into())
+                .spawn(move || {
+                    let out = std::process::Command::new("osascript")
+                        .arg("-e")
+                        .arg("display dialog \"确定清空收件箱全部内容？\" buttons {\"取消\", \"清空\"} default button \"取消\" with icon caution")
+                        .output();
+                    let confirmed = matches!(out, Ok(o) if String::from_utf8_lossy(&o.stdout).contains("button returned:清空"));
+                    if confirmed {
+                        let _ = tx.send(EngineCmd::ClearInbox);
+                    }
+                })
+                .ok();
+        }
+
         #[unsafe(method(openLogs:))]
         unsafe fn open_logs(&self, _sender: *mut AnyObject) {
             let p = self.ivars().log_path.clone();
@@ -181,6 +200,7 @@ unsafe fn rebuild_menu(menu: &NSMenu, paused: bool, ctrl: &NwcMenuController, mt
     menu.addItem(&separator(mtm));
     for it in [
         action_item("打开收件箱", Sel::register(c"openInbox:"), ctrl, mtm),
+        action_item("清空收件箱…", Sel::register(c"clearInbox:"), ctrl, mtm),
         action_item("打开日志", Sel::register(c"openLogs:"), ctrl, mtm),
         action_item("编辑配置", Sel::register(c"editConfig:"), ctrl, mtm),
         action_item(

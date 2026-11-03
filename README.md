@@ -23,7 +23,7 @@ Windows 端单个 ~2MB exe、私有内存 ~2MB；macOS 端单进程、剪贴板�
 - 大文件 256KB 分块流式传输（能力自动协商，内存占用恒定）
 - 剪贴板图片双向同步：Windows 端 PNG + CF_DIBV5 双格式写入、DIB（24/32bpp）自动转码；macOS 端 TIFF + PNG + PNGf 三格式写入，各类粘贴目标都能识别
 - 文字剪贴板历史（默认 20 条，重启保留；Windows 双击条目 / macOS 菜单栏「历史记录」点击条目即可重新复制并同步对端）
-- 收到文件时托盘气泡 / 系统通知提示
+- 收到文件时托盘气泡 / 系统通知提示；收件箱自动按天清理（中转缓存语义，默认保留 14 天）
 - 单实例保护（Windows 命名互斥量 / macOS flock），双开自动拦截
 - 自动过滤 198.18.0.0/15（Clash/Mihomo 等 fake-IP TUN 网段，避免误判对端）
 - 两端文件日志（`~/.networkclipboard/logs/`，按天滚动保留 7 天），剪贴板内容识别失败时自动记录格式诊断信息
@@ -48,7 +48,7 @@ nwc --help         # 全部参数
 （macOS 上二进制名为 `nwc-mac`）
 
 - 配置文件：`~/.networkclipboard/config.json`（Windows 设置对话框读写，保存后自动重启生效；macOS 菜单「编辑配置」用文本编辑器打开）
-- 收件箱默认 `~/NetWorkClipboard/inbox`；日志在 `~/.networkclipboard/logs/`（按天滚动、保留 7 天，两端 GUI 模式均落盘）
+- 收件箱默认 `~/NetWorkClipboard/inbox`——**它是文件中转缓存而非归档存储**：自动按保留天数清理（默认 14 天，`inboxKeepDays` 配置，`0` 关闭；启动与每批次接收后触发），也可在菜单「清空收件箱…」手动清理；日志在 `~/.networkclipboard/logs/`（按天滚动、保留 7 天，两端 GUI 模式均落盘）
 - 托盘/菜单栏菜单：暂停/恢复同步、历史记录、打开收件箱、打开日志、设置/编辑配置、开机自启（Windows 写 HKCU 注册表无 UAC；macOS 用 LaunchAgent）、退出
 - 历史记录：Windows 是独立窗口（双击粘贴、可删单条）；macOS 在菜单栏子菜单里（点击粘贴、**按住 Option 点击删除该条**）。默认保留 20 条（`~/.networkclipboard/history.json`），可在 config.json 用 `historyEnabled` / `historyLimit` 调整
 - macOS 菜单栏为 SF Symbol 状态图标（连接/扫描/暂停等），悬停显示状态文字

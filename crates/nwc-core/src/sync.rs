@@ -49,6 +49,8 @@ pub enum EngineCmd {
     RemoveHistory(String),
     /// 清空历史
     ClearHistory,
+    /// 清空收件箱（菜单触发；收件箱是中转缓存而非归档）
+    ClearInbox,
     Shutdown,
 }
 
@@ -352,6 +354,12 @@ impl Engine {
             self.cfg.port,
             std::env::consts::OS
         ));
+        // 收件箱是中转缓存而非归档：启动即按保留天数清理一次（顺带清掉崩溃残留的分块临时文件）
+        self.maybe_prune_inbox(true);
+        let stale_parts = crate::inbox::prune_parts(&self.cfg.state_dir, std::time::SystemTime::now());
+        if stale_parts > 0 {
+            self.log(format!("已清理 {} 个残留的分块传输临时文件", stale_parts));
+        }
         if self.cfg.token.is_empty() {
             self.warn("未设置口令（--token）：链路仍加密，但任何知道端口的人都能连上");
         } else {
@@ -678,6 +686,11 @@ impl Engine {
             EngineCmd::ClearHistory => {
                 self.history.clear();
                 crate::history::save(&self.cfg.state_dir, &self.history);
+            }
+            EngineCmd::ClearInbox => {
+                let (n, bytes) = crate::inbox::clear_inbox(&self.cfg.inbox_dir);
+                self.log(format!("收件箱已清空：删除 {} 个文件，释放 {}", n, fmt_bytes(bytes)));
+                self.notify("收件箱已清空", format!("删除 {} 个文件，释放 {}", n, fmt_bytes(bytes)));
             }
             EngineCmd::Clip(ev) => {
                 if !self.paused {
@@ -1574,6 +1587,25 @@ impl Engine {
         let incomplete = b.count > 0 && b.got < b.count;
         b.idle_at = Instant::now() + Duration::from_secs(3600);
         self.flush_batch(&mut b, incomplete);
+        // 批次落定后顺手做一次按天数的收件箱清理（刚收到的文件 mtime 是新的，不会误删）
+        self.maybe_prune_inbox(false);
+    }
+
+    /// 按 inbox_keep_days 清理收件箱（0 = 关闭）；startup 时附带说明配置
+    fn maybe_prune_inbox(&self, startup: bool) {
+        let days = self.cfg.inbox_keep_days;
+        if days == 0 {
+            if startup {
+                self.log("收件箱自动清理已关闭（inboxKeepDays=0）");
+            }
+            return;
+        }
+        let (n, bytes) = crate::inbox::prune_inbox(&self.cfg.inbox_dir, days, std::time::SystemTime::now());
+        if n > 0 {
+            self.log(format!("收件箱自动清理：删除 {} 天前的 {} 个文件，释放 {}", days, n, fmt_bytes(bytes)));
+        } else if startup {
+            self.log(format!("收件箱自动清理开启：保留最近 {} 天", days));
+        }
     }
 
     fn flush_all_batches(&mut self) {

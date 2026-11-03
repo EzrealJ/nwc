@@ -41,6 +41,8 @@ pub struct Config {
     /// 文字剪贴板历史（默认开，20 条）
     pub history_enabled: bool,
     pub history_limit: u64,
+    /// 收件箱自动清理：保留天数（收件箱是中转缓存而非归档；0 = 关闭自动清理）
+    pub inbox_keep_days: u64,
     pub state_dir: PathBuf,
     pub inbox_dir: PathBuf,
     // 运行时状态
@@ -76,6 +78,7 @@ impl Default for Config {
             max_transfer_files: 5000,
             history_enabled: true,
             history_limit: 20,
+            inbox_keep_days: 14,
             state_dir: home.join(".networkclipboard"),
             inbox_dir: home.join("NetWorkClipboard").join("inbox"),
             peer_hint: String::new(),
@@ -122,6 +125,7 @@ const NUM_KEYS: &[&str] = &[
     "max-file-bytes",
     "max-transfer-bytes",
     "max-transfer-files",
+    "inbox-keep-days",
 ];
 
 /// kebab → camel（对应 Node 版 parseArgs 的转换；scan-interval 特判修正，见模块注释）
@@ -396,6 +400,9 @@ fn apply(cfg: &mut Config, v: &JsonV) {
     if let Some(v) = u64_of(get("historyLimit")) {
         cfg.history_limit = v.clamp(1, 100);
     }
+    if let Some(v) = u64_of(get("inboxKeepDays")) {
+        cfg.inbox_keep_days = v.min(3650);
+    }
     if let Some(d) = get("inboxDir").and_then(JsonV::as_str) {
         if !d.is_empty() {
             cfg.inbox_dir = PathBuf::from(d);
@@ -426,7 +433,7 @@ pub fn usage() -> String {
            --config <路径>    指定配置文件（默认 ~/.networkclipboard/config.json）\n\
            --cli              无界面控制台模式（仅日志，无托盘）\n\
            --scan-interval <毫秒>  断线重扫间隔（默认 5000）\n\
-           --batch-idle-ms <毫秒>  接收批次的空闲兜底间隔（默认 30000）\n\
+           --batch-idle-ms <毫秒>  接收批次的空闲兜底间隔（默认 30000）\n         --inbox-keep-days <天> 收件箱自动清理保留天数（默认 14，0 关闭）\n\
            --help             显示本帮助\n\
          \n\
          也可以把选项写进 ~/.networkclipboard/config.json（键名同长选项，驼峰形式）。\n"

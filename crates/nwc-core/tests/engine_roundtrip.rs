@@ -50,6 +50,7 @@ struct Node {
     evt: mpsc::Receiver<EngineEvent>,
     writer: Arc<RecordingWriter>,
     done: mpsc::Receiver<()>,
+    inbox: PathBuf,
 }
 
 fn spawn_node(role: &str, target: &str, port: u16) -> Node {
@@ -72,13 +73,14 @@ fn spawn_node(role: &str, target: &str, port: u16) -> Node {
     let (evt_tx, evt_rx) = mpsc::channel();
     let (done_tx, done_rx) = mpsc::channel();
     let writer = Arc::new(RecordingWriter::default());
+    let inbox = cfg.inbox_dir.clone();
     let mut engine = Engine::new(cfg, Arc::clone(&writer) as Arc<dyn ClipboardWriter>, Box::new(Vec::new), cmd_rx, evt_tx);
     engine.set_cmd_sender(cmd_tx.clone());
     std::thread::spawn(move || {
         engine.run();
         let _ = done_tx.send(());
     });
-    Node { cmd: cmd_tx, evt: evt_rx, writer, done: done_rx }
+    Node { cmd: cmd_tx, evt: evt_rx, writer, done: done_rx, inbox }
 }
 
 fn wait_connected(evt: &mpsc::Receiver<EngineEvent>, who: &str) {
@@ -161,8 +163,21 @@ fn engine_e2e_text_and_image_sync() {
     );
     assert_eq!(got2, ());
 
+    // ④ ClearInbox 命令：收件箱被清空、根目录保留（收件箱是中转缓存的维护语义）
+    let junk_dir = client.inbox.clone();
+    std::fs::create_dir_all(&junk_dir).unwrap();
+    std::fs::write(junk_dir.join("old.txt"), b"junk").unwrap();
+    client.cmd.send(EngineCmd::ClearInbox).unwrap();
+    let _cleared = wait_for(
+        || (junk_dir.read_dir().map(|mut d| d.next().is_none()).unwrap_or(false)).then_some(()),
+        Duration::from_secs(5),
+        "收件箱被清空",
+    );
+    assert!(junk_dir.is_dir(), "收件箱根目录应保留");
+
     shutdown(client);
     shutdown(server);
     // 清理测试 state 目录（history.json 等）
     let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("nwc-e2e-{}", std::process::id())));
+    let _ = std::fs::remove_dir_all(&junk_dir);
 }

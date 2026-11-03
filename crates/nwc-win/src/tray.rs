@@ -45,6 +45,7 @@ const IDM_LOGS: u32 = 4;
 const IDM_SETTINGS: u32 = 5;
 const IDM_AUTOSTART: u32 = 6;
 const IDM_EXIT: u32 = 7;
+const IDM_CLEAR_INBOX: u32 = 9;
 
 pub struct TrayShared {
     pub icon_kind: Mutex<IconKind>,
@@ -293,6 +294,7 @@ unsafe fn show_menu(ctx: &TrayCtx, hwnd: HWND) {
     append(menu, IDM_PAUSE, if paused { "恢复同步" } else { "暂停同步" }, MF_STRING);
     append(menu, IDM_HISTORY, "历史记录…", MF_STRING);
     append(menu, IDM_INBOX, "打开收件箱", MF_STRING);
+    append(menu, IDM_CLEAR_INBOX, "清空收件箱…", MF_STRING);
     append(menu, IDM_LOGS, "打开日志", MF_STRING);
     append(menu, IDM_SETTINGS, "设置…", MF_STRING);
     append(menu, 0, "", MF_SEPARATOR);
@@ -332,6 +334,24 @@ unsafe fn show_menu(ctx: &TrayCtx, hwnd: HWND) {
         IDM_INBOX => {
             let _ = std::fs::create_dir_all(&ctx.inbox_dir);
             open_path(&ctx.inbox_dir.to_string_lossy());
+        }
+        IDM_CLEAR_INBOX => {
+            // 收件箱是中转缓存：删除不可逆，确认后再清
+            let msg: Vec<u16> = format!("确定清空收件箱全部内容？\n{}", ctx.inbox_dir.display())
+                .encode_utf16().chain(std::iter::once(0)).collect();
+            let title: Vec<u16> = "NetWorkClipboard".encode_utf16().chain(std::iter::once(0)).collect();
+            let ok = unsafe {
+                use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONWARNING, MB_OKCANCEL};
+                MessageBoxW(
+                    None,
+                    PCWSTR(msg.as_ptr()),
+                    PCWSTR(title.as_ptr()),
+                    MB_OKCANCEL | MB_ICONWARNING,
+                )
+            };
+            if ok == windows::Win32::UI::WindowsAndMessaging::IDOK {
+                let _ = ctx.cmd_tx.send(EngineCmd::ClearInbox);
+            }
         }
         IDM_LOGS => {
             if !ctx.log_path.exists() {
