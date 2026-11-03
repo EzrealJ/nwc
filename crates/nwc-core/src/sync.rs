@@ -235,6 +235,32 @@ fn resolve_rel(rel: &str) -> Vec<String> {
     segs
 }
 
+/// 接收文件的落位规则：不存在 → 原名；已存在且内容哈希一致 → 幂等覆盖
+/// （收件箱语义：同一文件永远占一份，刷新 mtime 配合按天清理）；
+/// 已存在但内容不同 → 后缀避让（绝不覆盖不同内容）。
+fn resolve_file_dest(dir: &Path, name: &str, incoming_sha: &str) -> PathBuf {
+    let p = dir.join(name);
+    if !p.exists() {
+        return p;
+    }
+    if stream_hash(&p).as_deref() == Some(incoming_sha) {
+        return p;
+    }
+    // 异内容：扫描后缀序列，同内容副本幂等覆盖，否则在序列尾部追加
+    let stem = Path::new(name).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let ext = Path::new(name).extension().map(|s| format!(".{}", s.to_string_lossy())).unwrap_or_default();
+    for i in 1..u32::MAX {
+        let cand = dir.join(format!("{stem} ({i}){ext}"));
+        if !cand.exists() {
+            return cand;
+        }
+        if stream_hash(&cand).as_deref() == Some(incoming_sha) {
+            return cand;
+        }
+    }
+    dir.join(format!("{stem} (x){ext}"))
+}
+
 fn unique_dest_path(dir: &Path, name: &str) -> PathBuf {
     let p = dir.join(name);
     if !p.exists() {
@@ -1318,7 +1344,7 @@ impl Engine {
             ));
             return;
         }
-        let dest = self.dest_for(&id, header, &segs, false);
+        let dest = self.dest_for(&id, header, &segs, false, &h);
         let Some(dest) = dest else {
             self.warn(format!("路径越界或过长，已忽略: {rel}"));
             return;
@@ -1367,7 +1393,7 @@ impl Engine {
         if self.batches.get(&id).map(|b| b.aborted).unwrap_or(false) {
             return;
         }
-        let Some(dest) = self.dest_for(&id, header, &segs, true) else {
+        let Some(dest) = self.dest_for(&id, header, &segs, true, "") else {
             self.warn(format!("路径越界或过长，已忽略: {rel}"));
             return;
         };
@@ -1385,11 +1411,11 @@ impl Engine {
         }
     }
 
-    /// 解析接收目标路径（ensureRoot + uniqueDestPath 语义；seg_only=true 表示顶层单项直接唯一化）
-    fn dest_for(&mut self, batch_id: &str, header: &Value, segs: &[String], is_dir: bool) -> Option<PathBuf> {
+    /// 解析接收目标路径（ensureRoot + 幂等/避让语义；同哈希覆盖、异内容后缀、子树同样规则）
+    fn dest_for(&mut self, batch_id: &str, header: &Value, segs: &[String], is_dir: bool, incoming_sha: &str) -> Option<PathBuf> {
         if segs.len() == 1 && !is_dir {
             std::fs::create_dir_all(&self.cfg.inbox_dir).ok()?;
-            return Some(unique_dest_path(&self.cfg.inbox_dir, &segs[0]));
+            return Some(resolve_file_dest(&self.cfg.inbox_dir, &segs[0], incoming_sha));
         }
         let key = root_key_of(header, segs);
         let name = segs[0].clone();
@@ -1411,12 +1437,19 @@ impl Engine {
             b.items.push(dest);
         }
         let root = b.roots.get(&key)?;
-        let dest = root.dest.join(segs[1..].iter().collect::<PathBuf>());
+        let direct = root.dest.join(segs[1..].iter().collect::<PathBuf>());
+        // 子树内文件与顶层同规则：同内容覆盖、异内容同级后缀避让
+        let dest = if is_dir || !direct.exists() || stream_hash(&direct).as_deref() == Some(incoming_sha) {
+            direct
+        } else {
+            let parent = direct.parent()?;
+            let name = file_name_of(&direct);
+            unique_dest_path(parent, &name)
+        };
         if cfg!(windows) && dest.to_string_lossy().len() > 240 {
             return None;
         }
-        // 目录已存在时（重名顶层项已在 dest_for 处理），内部子路径直接返回
-        Some(if is_dir { dest } else { dest })
+        Some(dest)
     }
 
     fn recv_chunk(&mut self, header: &Value, payload: &[u8]) {
@@ -1490,7 +1523,7 @@ impl Engine {
             let Some(b) = self.batches.get_mut(&batch_id) else { return };
             b.files += 1;
             b.bytes += inc.written;
-            b.hashes.push(h);
+            b.hashes.push(h.clone());
             if b.files > self.cfg.max_transfer_files || b.bytes > self.cfg.max_transfer_bytes {
                 b.aborted = true;
                 true
@@ -1504,7 +1537,7 @@ impl Engine {
             return;
         }
         let hdr_json = serde_json::json!({"ri": ri});
-        let Some(dest) = self.dest_for(&batch_id, &hdr_json, &segs, false) else {
+        let Some(dest) = self.dest_for(&batch_id, &hdr_json, &segs, false, &h) else {
             let _ = std::fs::remove_file(&inc.tmp);
             self.warn(format!("路径越界或过长，已忽略: {rel}"));
             return;
@@ -1773,6 +1806,63 @@ mod tests {
         assert!(resolve_rel("/./").is_empty());
         let many: Vec<String> = (0..100).map(|i| format!("d{i}")).collect();
         assert_eq!(resolve_rel(&many.join("/")).len(), 64);
+    }
+
+    struct NoopW;
+    impl ClipboardWriter for NoopW {
+        fn set_text(&self, _s: &str) -> bool { true }
+        fn set_image(&self, _p: &[u8]) -> bool { true }
+        fn set_files(&self, _p: &[PathBuf]) -> bool { true }
+    }
+
+    fn inbox_entries(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+            .unwrap_or_default();
+        v.sort();
+        v
+    }
+
+    /// 接收幂等语义：同内容重复接收不产生 (N) 副本；同名异内容才后缀避让
+    #[test]
+    fn incoming_file_idempotent_landing() {
+        use std::sync::Arc;
+        let dir = std::env::temp_dir().join(format!("nwc-idem-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut cfg = crate::config::Config::default();
+        cfg.state_dir = dir.join("state");
+        cfg.inbox_dir = dir.join("inbox");
+        cfg.inbox_keep_days = 0;
+
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (evt_tx, _evt) = std::sync::mpsc::channel();
+        let mut e = Engine::new(cfg, Arc::new(NoopW), Box::new(Vec::new), cmd_rx, evt_tx);
+        e.set_cmd_sender(cmd_tx);
+
+        let send = |e: &mut Engine, rel: &str, payload: &[u8], batch: &str| {
+            let hdr = serde_json::json!({
+                "t": "file", "rel": rel, "size": payload.len(),
+                "sha256": crate::util::sha256_hex(payload),
+                "index": 1, "count": 1, "ri": 0, "batchId": batch,
+            });
+            e.handle_cmd(EngineCmd::PeerBin(hdr, payload.to_vec()));
+        };
+
+        let inbox = dir.join("inbox");
+        // 同内容两次：只应有一份 dup.txt
+        send(&mut e, "dup.txt", b"aaa", "b1");
+        send(&mut e, "dup.txt", b"aaa", "b2");
+        assert_eq!(inbox_entries(&inbox), vec!["dup.txt".to_string()], "同内容重复接收不应产生副本");
+
+        // 内容改为 bbb 再来：异内容 → 后缀避让，两份共存
+        send(&mut e, "dup.txt", b"bbb", "b3");
+        assert_eq!(inbox_entries(&inbox), vec!["dup (1).txt".to_string(), "dup.txt".to_string()], "同名异内容应后缀避让");
+
+        // 再传一次 bbb 内容：与 dup (1).txt 幂等，不产生第三份
+        send(&mut e, "dup.txt", b"bbb", "b4");
+        assert_eq!(inbox_entries(&inbox).len(), 2, "与既有副本同内容应幂等覆盖");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
