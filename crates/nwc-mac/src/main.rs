@@ -10,6 +10,8 @@ mod autostart;
 #[cfg(target_os = "macos")]
 mod pasteboard;
 #[cfg(target_os = "macos")]
+mod settings;
+#[cfg(target_os = "macos")]
 mod statusbar;
 
 #[cfg(target_os = "macos")]
@@ -84,8 +86,9 @@ fn main() {
     } else {
         // 菜单栏模式单实例：state_dir/instance.lock 加 flock（进程退出自动释放）。
         // 双实例会互抢剪贴板回声抑制，必须拦下（对齐 Windows 端的命名互斥量）。
-        let _single_lock = match acquire_single_instance(&state_dir) {
-            Some(f) => f,
+        // 句柄存全局：设置保存后 restart_process 需先释放再拉新实例。
+        match acquire_single_instance(&state_dir) {
+            Some(f) => *SINGLE_LOCK.lock().unwrap() = Some(f),
             None => {
                 let _ = std::process::Command::new("osascript")
                     .arg("-e")
@@ -93,13 +96,31 @@ fn main() {
                     .status();
                 return;
             }
-        };
+        }
         // 菜单栏模式（主线程跑 AppKit）：GUI 无控制台，日志落文件（按天滚动、保留 7 天）
         let logger = nwc_core::logger::FileLogger::new(&state_dir);
         logger.prune(7);
         let log_path = logger.latest_path();
         statusbar::run(cmd_tx, evt_rx, inbox_dir, cfg_path, logger, log_path);
     }
+}
+
+/// 单实例锁句柄（进程存活期间持有；重启时主动释放）
+#[cfg(target_os = "macos")]
+static SINGLE_LOCK: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
+
+/// 释放单实例锁 → 拉起新实例 → 退出（设置保存后按新配置生效）
+#[cfg(target_os = "macos")]
+pub fn restart_process() {
+    // 先释放 flock，再启动新进程（否则新实例会被单实例保护拦下）
+    if let Some(f) = SINGLE_LOCK.lock().unwrap().take() {
+        drop(f);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = std::process::Command::new(exe).spawn();
+    }
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    std::process::exit(0);
 }
 
 #[cfg(target_os = "macos")]

@@ -135,6 +135,12 @@ define_class! {
             let _ = std::process::Command::new("open").arg("-t").arg(&p).spawn();
         }
 
+        #[unsafe(method(openSettings:))]
+        unsafe fn open_settings(&self, _sender: *mut AnyObject) {
+            let Some(mtm) = MainThreadMarker::new() else { return };
+            crate::settings::open_settings(mtm, self.ivars().cfg_path.clone());
+        }
+
         #[unsafe(method(editConfig:))]
         unsafe fn edit_config(&self, _sender: *mut AnyObject) {
             let p = self.ivars().cfg_path.clone();
@@ -223,7 +229,8 @@ unsafe fn rebuild_menu(menu: &NSMenu, paused: bool, ctrl: &NwcMenuController, mt
         action_item("打开收件箱", Sel::register(c"openInbox:"), ctrl, mtm),
         action_item("清空收件箱…", Sel::register(c"clearInbox:"), ctrl, mtm),
         action_item("打开日志", Sel::register(c"openLogs:"), ctrl, mtm),
-        action_item("编辑配置", Sel::register(c"editConfig:"), ctrl, mtm),
+        action_item("设置…", Sel::register(c"openSettings:"), ctrl, mtm),
+        action_item("编辑配置文件…", Sel::register(c"editConfig:"), ctrl, mtm),
         action_item(
             &format!("开机自启{}", if autostart::autostart_enabled() { " ✓" } else { "" }),
             Sel::register(c"toggleAutostart:"),

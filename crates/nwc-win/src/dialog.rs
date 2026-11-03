@@ -324,14 +324,24 @@ fn on_save(hwnd: HWND) {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let obj = serde_json::json!({
-            "token": token,
-            "port": port,
-            "name": name,
-            "role": role,
-            "inboxDir": inbox,
-        });
-        if std::fs::write(&path, serde_json::to_string_pretty(&obj).unwrap_or_default()).is_err() {
+        // 合并写：只覆盖对话框管理的键，保留用户手写的其它键（scanCidr/inboxKeepDays 等）
+        let mut v: serde_json::Value = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("token".into(), serde_json::json!(token));
+            obj.insert("port".into(), serde_json::json!(port));
+            obj.insert("name".into(), serde_json::json!(name));
+            obj.insert("role".into(), serde_json::json!(role));
+            if inbox.is_empty() {
+                obj.remove("inboxDir");
+            } else {
+                obj.insert("inboxDir".into(), serde_json::json!(inbox));
+            }
+        }
+        let text = serde_json::to_string_pretty(&v).unwrap_or_default();
+        if std::fs::write(&path, text + "\n").is_err() {
             warn_box(hwnd, &format!("写入失败：{}", path.display()));
             return;
         }
