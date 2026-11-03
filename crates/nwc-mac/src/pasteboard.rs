@@ -331,7 +331,13 @@ unsafe fn write_files(paths: &[PathBuf]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    //! 平台 API 真机测试：直接操作系统剪贴板验证读写全链路（会覆盖真实剪贴板内容）。
+    //! 剪贴板是进程全局状态，静态锁强制串行（CI 再加 --test-threads=1 双保险）。
+
     use super::*;
+
+    /// 全局串行锁：同一测试二进制内所有剪贴板测试互斥
+    static PB_LOCK: Mutex<()> = Mutex::new(());
 
     /// 1x1 红色不透明 PNG（字节由脚本生成，确定性内容）
     const TINY_PNG_B64: &str =
@@ -342,10 +348,37 @@ mod tests {
         base64::engine::general_purpose::STANDARD.decode(TINY_PNG_B64).unwrap()
     }
 
+    #[test]
+    fn text_roundtrip() {
+        let _g = PB_LOCK.lock().unwrap();
+        let s = "你好 nwc ✓ emoji";
+        objc2::rc::autoreleasepool(|_pool| unsafe {
+            assert!(write_text(s), "写入应成功");
+            assert_eq!(read_text().as_deref(), Some(s), "读回应与写入一致");
+        });
+    }
+
+    /// write_files 用 writeObjects(NSURL)、read_files 读 NSFilenames 属性列表——
+    /// 两种表示的互通性正是「未在真机验证」清单里的遗留项，这里实机锁定
+    #[test]
+    fn files_roundtrip() {
+        let _g = PB_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join("nwc-mac-pb-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("测试文件.txt");
+        std::fs::write(&f, b"x").unwrap();
+        objc2::rc::autoreleasepool(|_pool| unsafe {
+            assert!(write_files(&[f.clone()]), "写入应成功");
+            assert_eq!(read_files(), Some(vec![f.clone()]), "writeObjects(NSURL) 应能被 NSFilenames 读取");
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 写入应同时挂 public.tiff / public.png / PNGf 三种类型，且能按各自类型读回
     /// （注意：会动真实系统剪贴板，仅在手动跑 `cargo test -p nwc-mac` 时执行）
     #[test]
     fn write_image_sets_tiff_png_pngf() {
+        let _g = PB_LOCK.lock().unwrap();
         let png = tiny_png();
         objc2::rc::autoreleasepool(|_pool| unsafe {
             assert!(write_image_png(&png), "写入应返回成功");

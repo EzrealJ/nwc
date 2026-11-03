@@ -309,6 +309,7 @@ dependencies = [
 name = "nwc-win"
 version = "0.2.0"
 dependencies = [
+ "base64",
  "nwc-core",
  "serde_json",
  "windows",

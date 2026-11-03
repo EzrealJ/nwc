@@ -40,3 +40,6 @@ windows = { version = "0.57", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_System_LibraryLoader",
 ] }
+
+[dev-dependencies]
+base64 = "0.22"

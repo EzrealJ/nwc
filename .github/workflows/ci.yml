@@ -1,0 +1,43 @@
+# 日常 CI：push/PR 时跑测试矩阵。
+# 分层策略（保障组合可用性）：
+# - core（平台无关逻辑）→ Linux 主阵地，win/mac 顺带复跑（core 内有 cfg 分支测试：
+#   Windows 保留文件名 / unix 本地时间戳，各平台行为各自锁定）
+# - 壳层平台 API 真机测试（剪贴板读写往返）→ 只能在对应系统的 runner 上跑
+# - 端到端（engine_roundtrip / loopback：双引擎真实 TCP 互发）→ core 包，Linux 跑
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  core:
+    name: core (linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p nwc-core
+
+  mac:
+    name: mac platform tests
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p nwc-core
+      # 剪贴板是全局状态：测试内静态锁 + 单线程双保险
+      - run: cargo test -p nwc-mac -- --test-threads=1
+
+  win:
+    name: win platform tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p nwc-core
+      - run: cargo test -p nwc-win -- --test-threads=1

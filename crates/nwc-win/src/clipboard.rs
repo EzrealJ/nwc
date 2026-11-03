@@ -522,3 +522,88 @@ fn write_image(png_bytes: &[u8]) -> bool {
     })
     .unwrap_or(false)
 }
+
+#[cfg(test)]
+mod tests {
+    //! 平台 API 真机测试：直接操作系统剪贴板，验证写入/读取全链路。
+    //! 剪贴板是进程全局状态，用静态锁强制串行（CI 再加 --test-threads=1 双保险）。
+
+    use super::*;
+
+    /// 全局串行锁：同一测试二进制内所有剪贴板测试互斥
+    static CLIP_LOCK: Mutex<()> = Mutex::new(());
+
+    /// 1x1 红色不透明 PNG（与 mac 端测试同源字节，确定性内容）
+    const TINY_PNG_B64: &str =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+
+    fn tiny_png() -> Vec<u8> {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.decode(TINY_PNG_B64).unwrap()
+    }
+
+    /// 测试用 Inner（read_image_png 需要；diag=None 即静默）
+    fn test_inner() -> Inner {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        Inner {
+            tx,
+            diag: None,
+            self_seq: Mutex::new(0),
+            token: Mutex::new((String::new(), None)),
+        }
+    }
+
+    #[test]
+    fn text_roundtrip() {
+        let _g = CLIP_LOCK.lock().unwrap();
+        let s = "你好 nwc ✓ emoji";
+        assert!(write_text(s), "写入应成功");
+        assert_eq!(read_text().as_deref(), Some(s), "读回应与写入一致");
+    }
+
+    #[test]
+    fn image_roundtrip_png_and_dibv5() {
+        let _g = CLIP_LOCK.lock().unwrap();
+        let png = tiny_png();
+        assert!(write_image(&png), "写入应成功");
+        // PNG 注册格式与 CF_DIBV5 应同时挂在剪贴板上（多格式兼容的关键）
+        let png_fmt = register_png_format();
+        with_open_clipboard(OPEN_RETRY_READ, || unsafe {
+            assert!(IsClipboardFormatAvailable(png_fmt.0 as u32).is_ok(), "应存在 PNG 注册格式");
+            assert!(IsClipboardFormatAvailable(CF_DIBV5.0 as u32).is_ok(), "应存在 CF_DIBV5");
+            Some(())
+        })
+        .unwrap();
+        // 读回应拿到原始 PNG 字节（PNG 格式优先、无损直读）
+        assert_eq!(read_image_png(&test_inner()).as_deref(), Some(&png[..]));
+    }
+
+    #[test]
+    fn image_roundtrip_dib_only() {
+        // 模拟只放 DIBV5 的来源（如截图工具）：CF_DIBV5 → 解码回 PNG
+        let _g = CLIP_LOCK.lock().unwrap();
+        let png = tiny_png();
+        let dib = nwc_core::dib::png_to_dibv5(&png).unwrap();
+        with_open_clipboard(OPEN_RETRY_WRITE, || unsafe {
+            assert!(EmptyClipboard().is_ok());
+            let Some(h) = alloc_hglobal(&dib) else { return None };
+            assert!(SetClipboardData(CF_DIBV5.0 as u32, HANDLE(h.0 as isize)).is_ok());
+            Some(true)
+        })
+        .unwrap();
+        let back = read_image_png(&test_inner()).expect("纯 DIBV5 也应能读出图片");
+        assert_eq!(&back[..8], &png[..8], "解码结果应为合法 PNG（同签名）");
+    }
+
+    #[test]
+    fn files_roundtrip() {
+        let _g = CLIP_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join("nwc-win-clip-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("测试文件.txt");
+        std::fs::write(&f, b"x").unwrap();
+        assert!(write_files(&[f.clone()]), "写入应成功");
+        assert_eq!(read_files(), Some(vec![f]), "读回路径应一致");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

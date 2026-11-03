@@ -22,6 +22,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p nwc-core
+      - run: cargo test -p nwc-win -- --test-threads=1
       - run: cargo build --release -p nwc-win
       - name: 打包
         shell: bash
@@ -54,6 +55,9 @@ jobs:
         with:
           key: ${{ matrix.target }}
       - run: cargo test -p nwc-core
+        if: matrix.arch == 'arm64' # runner 原生跑一遍即可，两个交叉 target 无需重复
+      - run: cargo test -p nwc-mac -- --test-threads=1
+        if: matrix.arch == 'arm64'
       - run: cargo build --release -p nwc-mac --target ${{ matrix.target }}
       - name: 打包
         shell: bash
