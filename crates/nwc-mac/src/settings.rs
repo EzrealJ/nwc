@@ -224,10 +224,10 @@ pub fn open_settings(mtm: MainThreadMarker, cfg_path: PathBuf) {
         place(as_obj(&*history_on), PAD, y, half + 40.0, EDIT_H);
         y += EDIT_H + ROW_GAP;
 
-        let ll = label(mtm, "历史条数（1-100）");
+        let ll = label(mtm, "历史条数");
         place(as_obj(&*ll), PAD, y + 4.0, half, LABEL_H);
-        let ld = label(mtm, "收件箱保留天数（0 = 不清理）");
-        place(as_obj(&*ld), x2, y + 4.0, full, LABEL_H);
+        let ld = label(mtm, "收件箱保留天数");
+        place(as_obj(&*ld), x2, y + 4.0, half, LABEL_H);
         y += LABEL_H + ROW_GAP;
         let history_limit = edit(mtm, &cur.history_limit);
         place(as_obj(&*history_limit), PAD, y, 100.0, EDIT_H);
@@ -266,8 +266,8 @@ pub fn open_settings(mtm: MainThreadMarker, cfg_path: PathBuf) {
             mtm,
         );
         place(as_obj(&*cancel_btn), PAD + 122.0, y, 76.0, 30.0);
-        let hint = label(mtm, "保存后程序自动重启并按新配置运行");
-        place(as_obj(&*hint), PAD + 215.0, y + 8.0, full, LABEL_H);
+        let hint = label(mtm, "保存后自动重启生效");
+        place(as_obj(&*hint), PAD + 215.0, y + 8.0, CW - PAD - (PAD + 215.0), LABEL_H);
 
         window.center();
         window.makeKeyAndOrderFront(None);
