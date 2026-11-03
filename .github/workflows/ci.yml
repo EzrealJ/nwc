@@ -1,4 +1,4 @@
-# 日常 CI：push/PR 时跑测试矩阵。
+# 日常 CI：PR 全矩阵把关，main 只在代码变更时跑（省公共资源）。
 # 分层策略（保障组合可用性）：
 # - core（平台无关逻辑）→ Linux 主阵地，win/mac 顺带复跑（core 内有 cfg 分支测试：
 #   Windows 保留文件名 / unix 本地时间戳，各平台行为各自锁定）
@@ -9,7 +9,23 @@ name: ci
 on:
   push:
     branches: [main]
+    paths: # 纯文档/示例变更不消耗 runner
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/ci.yml'
   pull_request:
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/ci.yml'
+  workflow_dispatch: # 手动兜底入口
+
+# 同一 PR/分支连续推送时取消旧的在跑任务
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   core:
