@@ -54,6 +54,11 @@ struct Node {
 }
 
 fn spawn_node(role: &str, target: &str, port: u16) -> Node {
+    spawn_node_with(role, target, port, |_| {})
+}
+
+/// setup 在引擎启动前执行（可预写 state.json，如配对偏好）
+fn spawn_node_with(role: &str, target: &str, port: u16, setup: impl FnOnce(&std::path::Path)) -> Node {
     let mut cfg = Config::default();
     cfg.node_id = format!("{}-{}", protocol::new_node_id(), PORT_SEQ.fetch_add(1, Ordering::SeqCst));
     cfg.port = port;
@@ -74,6 +79,7 @@ fn spawn_node(role: &str, target: &str, port: u16) -> Node {
     let (done_tx, done_rx) = mpsc::channel();
     let writer = Arc::new(RecordingWriter::default());
     let inbox = cfg.inbox_dir.clone();
+    setup(&cfg.state_dir);
     let mut engine = Engine::new(cfg, Arc::clone(&writer) as Arc<dyn ClipboardWriter>, Box::new(Vec::new), cmd_rx, evt_tx);
     engine.set_cmd_sender(cmd_tx.clone());
     std::thread::spawn(move || {
@@ -180,4 +186,51 @@ fn engine_e2e_text_and_image_sync() {
     // 清理测试 state 目录（history.json 等）
     let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("nwc-e2e-{}", std::process::id())));
     let _ = std::fs::remove_dir_all(&junk_dir);
+}
+
+/// strict 配对：服务端配对为不存在的设备并开启 strict 时，应拒绝其他设备连接
+#[test]
+fn engine_strict_peer_rejects_unpaired() {
+    let port = free_port();
+    let server = spawn_node_with("server", "", port, |state| {
+        std::fs::create_dir_all(state).unwrap();
+        std::fs::write(
+            state.join("state.json"),
+            r#"{"preferredPeer":"00000000deadbeef","peerStrict":true}"#,
+        )
+        .unwrap();
+    });
+    let client = spawn_node("client", "127.0.0.1", port);
+
+    // 协议时序：TCP 握手双向完成后客户端会瞬态进入 Connected，随后才被服务端断开。
+    // 因此断言针对服务端行为：出现拒绝记录，且从未进入会话（无「已接受连接」）。
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let mut rejected = false;
+    let mut accepted_session = false;
+    let mut logs: Vec<String> = Vec::new();
+    loop {
+        if Instant::now() > deadline {
+            break;
+        }
+        while let Ok(ev) = server.evt.try_recv() {
+            if let EngineEvent::Log(m) = ev {
+                if m.contains("已拒绝") {
+                    rejected = true;
+                }
+                if m.contains("已接受连接") {
+                    accepted_session = true;
+                }
+                logs.push(m);
+            }
+        }
+        // 客户端事件持续排空，防止通道积压
+        while let Ok(_) = client.evt.try_recv() {}
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(rejected, "服务端应记录拒绝事件；服务端日志: {logs:?}");
+    assert!(!accepted_session, "strict 模式下不应进入会话");
+
+    shutdown(client);
+    shutdown(server);
+    let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("nwc-e2e-{}", std::process::id())));
 }

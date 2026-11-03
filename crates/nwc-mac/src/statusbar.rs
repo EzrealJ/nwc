@@ -78,6 +78,25 @@ define_class! {
             let _ = self.ivars().cmd_tx.send(EngineCmd::ClearHistory);
         }
 
+        /// 配对：点击已知对端条目设为优先设备
+        #[unsafe(method(setPeerPref:))]
+        unsafe fn set_peer_pref(&self, sender: *mut AnyObject) {
+            let Some(node_id) = represented_text(sender) else { return };
+            let _ = self.ivars().cmd_tx.send(EngineCmd::SetPeerPref { node_id: Some(node_id), strict: None });
+        }
+
+        /// strict 开关：仅与配对设备同步（未配对时无效果）
+        #[unsafe(method(toggleStrictPeer:))]
+        unsafe fn toggle_strict_peer(&self, _sender: *mut AnyObject) {
+            let (_, strict) = nwc_core::peers::load_pref(&self.ivars().state_dir);
+            let _ = self.ivars().cmd_tx.send(EngineCmd::SetPeerPref { node_id: None, strict: Some(!strict) });
+        }
+
+        #[unsafe(method(clearPeerPref:))]
+        unsafe fn clear_peer_pref(&self, _sender: *mut AnyObject) {
+            let _ = self.ivars().cmd_tx.send(EngineCmd::SetPeerPref { node_id: Some(String::new()), strict: None });
+        }
+
         #[unsafe(method(openInbox:))]
         unsafe fn open_inbox(&self, _sender: *mut AnyObject) {
             let dir = self.ivars().inbox.clone();
@@ -198,6 +217,8 @@ unsafe fn rebuild_menu(menu: &NSMenu, paused: bool, ctrl: &NwcMenuController, mt
     menu.addItem(&separator(mtm));
     append_history_submenu(menu, ctrl, mtm);
     menu.addItem(&separator(mtm));
+    append_peers_submenu(menu, ctrl, mtm);
+    menu.addItem(&separator(mtm));
     for it in [
         action_item("打开收件箱", Sel::register(c"openInbox:"), ctrl, mtm),
         action_item("清空收件箱…", Sel::register(c"clearInbox:"), ctrl, mtm),
@@ -213,6 +234,48 @@ unsafe fn rebuild_menu(menu: &NSMenu, paused: bool, ctrl: &NwcMenuController, mt
     ] {
         menu.addItem(&it);
     }
+}
+
+/// 已知对端子菜单：点条目设为配对设备（✓ 当前配对）；strict 开关 + 清除配对
+unsafe fn append_peers_submenu(menu: &NSMenu, ctrl: &NwcMenuController, mtm: MainThreadMarker) {
+    let state_dir = ctrl.ivars().state_dir.clone();
+    let peers = nwc_core::peers::load(&state_dir);
+    let (preferred, strict) = nwc_core::peers::load_pref(&state_dir);
+    let sub = NSMenu::new(mtm);
+    if peers.is_empty() {
+        let it = disabled_item("（暂无已知设备，连接成功后自动登记）", mtm);
+        sub.addItem(&it);
+    } else {
+        for p in &peers {
+            let chosen = p.node_id == preferred;
+            let it = NSMenuItem::new(mtm);
+            let mut title = format!("{} · {} · #{}", p.name, p.last_ip, nwc_core::peers::short_id(&p.node_id));
+            if chosen {
+                title.push_str("  ✓");
+            }
+            it.setTitle(&NSString::from_str(&title));
+            it.setAction(Some(Sel::register(c"setPeerPref:")));
+            it.setTarget(Some(as_any(ctrl)));
+            it.setRepresentedObject(Some(&NSString::from_str(&p.node_id)));
+            sub.addItem(&it);
+        }
+        sub.addItem(&separator(mtm));
+        let strict_item = action_item(
+            &format!("仅与配对设备同步{}", if strict { " ✓" } else { "" }),
+            Sel::register(c"toggleStrictPeer:"),
+            ctrl,
+            mtm,
+        );
+        sub.addItem(&strict_item);
+        if !preferred.is_empty() {
+            let clear = action_item("清除配对", Sel::register(c"clearPeerPref:"), ctrl, mtm);
+            sub.addItem(&clear);
+        }
+    }
+    let root = NSMenuItem::new(mtm);
+    root.setTitle(&NSString::from_str("已知对端"));
+    root.setSubmenu(Some(&sub));
+    menu.addItem(&root);
 }
 
 /// 历史记录子菜单：点条目 = 粘贴并同步；按住 Option 点 = 删除（对齐 Windows 历史窗口能力）

@@ -33,7 +33,7 @@ fn main() {
         print!("{}", usage());
         return;
     }
-    cfg.node_id = nwc_core::protocol::new_node_id();
+    cfg.node_id = nwc_core::protocol::load_or_create_device_id(&cfg.state_dir);
     cfg.peer_hint = nwc_core::sync::load_peer_hint(&cfg);
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<EngineCmd>();

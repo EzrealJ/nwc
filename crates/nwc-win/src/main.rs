@@ -139,7 +139,7 @@ use windows::core::PCWSTR;
 /// 公共装配：剪贴板 + 引擎线程；返回 (cmd_tx, evt_rx, clipboard)
 #[cfg(windows)]
 fn assemble(mut cfg: nwc_core::config::Config) -> (mpsc::Sender<EngineCmd>, mpsc::Receiver<EngineEvent>, Arc<clipboard::WinClipboard>) {
-    cfg.node_id = nwc_core::protocol::new_node_id();
+    cfg.node_id = nwc_core::protocol::load_or_create_device_id(&cfg.state_dir);
     cfg.peer_hint = nwc_core::sync::load_peer_hint(&cfg);
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<EngineCmd>();

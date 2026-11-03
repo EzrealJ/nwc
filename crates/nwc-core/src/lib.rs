@@ -15,6 +15,7 @@ pub mod echo;
 pub mod history;
 pub mod inbox;
 pub mod logger;
+pub mod peers;
 pub mod protocol;
 pub mod sync;
 pub mod timestamp;

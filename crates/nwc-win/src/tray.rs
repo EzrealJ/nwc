@@ -19,7 +19,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DestroyWindow, DispatchMessageW, EnableMenuItem, GetMessageW, GetWindowLongPtrW, MessageBoxW,
     PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow, SetWindowLongPtrW,
     GetCursorPos, TrackPopupMenu, TranslateMessage, GWLP_USERDATA, HICON, HMENU, MENU_ITEM_FLAGS, MSG,
-    MB_ICONWARNING, MB_OK, MF_BYCOMMAND, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING,
+    MB_ICONWARNING, MB_OK, MF_BYCOMMAND, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING,
     SM_CXSCREEN, SW_SHOWNORMAL, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON,
     WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_DESTROY, WM_RBUTTONUP, WM_CONTEXTMENU,
     WM_LBUTTONUP, WM_RBUTTONDBLCLK, WNDCLASSW,
@@ -46,6 +46,10 @@ const IDM_SETTINGS: u32 = 5;
 const IDM_AUTOSTART: u32 = 6;
 const IDM_EXIT: u32 = 7;
 const IDM_CLEAR_INBOX: u32 = 9;
+const IDM_PEER_STRICT: u32 = 10;
+const IDM_PEER_CLEAR: u32 = 11;
+/// 已知对端动态条目基址：ID = IDM_PEER_BASE + index
+const IDM_PEER_BASE: u32 = 100;
 
 pub struct TrayShared {
     pub icon_kind: Mutex<IconKind>,
@@ -295,8 +299,39 @@ unsafe fn show_menu(ctx: &TrayCtx, hwnd: HWND) {
     append(menu, IDM_HISTORY, "历史记录…", MF_STRING);
     append(menu, IDM_INBOX, "打开收件箱", MF_STRING);
     append(menu, IDM_CLEAR_INBOX, "清空收件箱…", MF_STRING);
-    append(menu, IDM_LOGS, "打开日志", MF_STRING);
     append(menu, IDM_SETTINGS, "设置…", MF_STRING);
+    // 已知对端子菜单：点条目配对；strict 开关；清除配对
+    let peers = nwc_core::peers::load(&ctx.state_dir);
+    let (preferred, strict) = nwc_core::peers::load_pref(&ctx.state_dir);
+    if let Ok(sub) = CreatePopupMenu() {
+        if peers.is_empty() {
+            append(sub, 0, "（暂无已知设备，连接成功后自动登记）", MF_STRING | MF_GRAYED);
+        } else {
+            for (i, p) in peers.iter().enumerate() {
+                let mark = if p.node_id == preferred { "  ✓" } else { "" };
+                append(
+                    sub,
+                    IDM_PEER_BASE + i as u32,
+                    &format!("{} · {} · #{}{}", p.name, p.last_ip, nwc_core::peers::short_id(&p.node_id), mark),
+                    MF_STRING,
+                );
+                if p.node_id == preferred {
+                    CheckMenuItem(sub, IDM_PEER_BASE + i as u32, MF_BYCOMMAND.0 | MF_CHECKED.0);
+                }
+            }
+            append(sub, 0, "", MF_SEPARATOR);
+            append(sub, IDM_PEER_STRICT, &format!("仅与配对设备同步{}", if strict { " ✓" } else { "" }), MF_STRING);
+            if strict {
+                CheckMenuItem(sub, IDM_PEER_STRICT, MF_BYCOMMAND.0 | MF_CHECKED.0);
+            }
+            if !preferred.is_empty() {
+                append(sub, IDM_PEER_CLEAR, "清除配对", MF_STRING);
+            }
+        }
+        let wide: Vec<u16> = "已知对端\0".encode_utf16().collect();
+        AppendMenuW(menu, MF_POPUP, sub.0 as usize, PCWSTR(wide.as_ptr()));
+    }
+    append(menu, IDM_LOGS, "打开日志", MF_STRING);
     append(menu, 0, "", MF_SEPARATOR);
     append(menu, IDM_AUTOSTART, "开机自启", MF_STRING);
     if auto {
@@ -334,6 +369,19 @@ unsafe fn show_menu(ctx: &TrayCtx, hwnd: HWND) {
         IDM_INBOX => {
             let _ = std::fs::create_dir_all(&ctx.inbox_dir);
             open_path(&ctx.inbox_dir.to_string_lossy());
+        }
+        id if (IDM_PEER_BASE..IDM_PEER_BASE + 32).contains(&id) => {
+            let peers = nwc_core::peers::load(&ctx.state_dir);
+            if let Some(p) = peers.get((id - IDM_PEER_BASE) as usize) {
+                let _ = ctx.cmd_tx.send(EngineCmd::SetPeerPref { node_id: Some(p.node_id.clone()), strict: None });
+            }
+        }
+        IDM_PEER_STRICT => {
+            let (_, strict) = nwc_core::peers::load_pref(&ctx.state_dir);
+            let _ = ctx.cmd_tx.send(EngineCmd::SetPeerPref { node_id: None, strict: Some(!strict) });
+        }
+        IDM_PEER_CLEAR => {
+            let _ = ctx.cmd_tx.send(EngineCmd::SetPeerPref { node_id: Some(String::new()), strict: None });
         }
         IDM_CLEAR_INBOX => {
             // 收件箱是中转缓存：删除不可逆，确认后再清

@@ -51,6 +51,8 @@ pub enum EngineCmd {
     ClearHistory,
     /// 清空收件箱（菜单触发；收件箱是中转缓存而非归档）
     ClearInbox,
+    /// 配对偏好：node_id=None 表示清除配对；strict=仅与配对设备同步
+    SetPeerPref { node_id: Option<String>, strict: Option<bool> },
     Shutdown,
 }
 
@@ -99,6 +101,9 @@ pub struct Engine {
     history: Vec<crate::history::HistoryEntry>,
     /// 接收分块传输的进行中文件（batchId, rel) -> 状态
     incoming: HashMap<(String, String), IncomingFile>,
+    /// 配对偏好（state.json）：preferredPeer（node_id，空=未设置）+ peerStrict
+    preferred_peer: String,
+    strict_peer: bool,
 }
 
 struct IncomingFile {
@@ -307,6 +312,7 @@ impl Engine {
     ) -> Self {
         let tx_cmd = rx_dummy();
         let history = crate::history::load(&cfg.state_dir);
+        let (preferred_peer, strict_peer) = crate::peers::load_pref(&cfg.state_dir);
         Engine {
             cfg,
             echo: EchoGuard::new(10000),
@@ -323,6 +329,8 @@ impl Engine {
             last_peer_label: String::new(),
             incoming: HashMap::new(),
             history,
+            preferred_peer,
+            strict_peer,
         }
     }
 
@@ -380,6 +388,15 @@ impl Engine {
             self.cfg.port,
             std::env::consts::OS
         ));
+        // 配对快速路径：优先对端有已知 IP 时直连（显式 --target / peer_hint 优先级更高）
+        if self.cfg.target.is_empty() && self.cfg.peer_hint.is_empty() && !self.preferred_peer.is_empty() {
+            if let Some(p) = crate::peers::load(&self.cfg.state_dir)
+                .into_iter()
+                .find(|p| p.node_id == self.preferred_peer)
+            {
+                self.cfg.peer_hint = p.last_ip;
+            }
+        }
         // 收件箱是中转缓存而非归档：启动即按保留天数清理一次（顺带清掉崩溃残留的分块临时文件）
         self.maybe_prune_inbox(true);
         let stale_parts = crate::inbox::prune_parts(&self.cfg.state_dir, std::time::SystemTime::now());
@@ -521,10 +538,16 @@ impl Engine {
             self.log(format!("尝试连接 {ip}:{} …", self.cfg.port));
             match PeerConnection::connect(&ip.to_string(), self.cfg.port, &peer_opts(&self.cfg)) {
                 Ok(acc) => {
+                    if self.peer_rejected(&acc.peer.remote.node_id) {
+                        self.log(format!("已拒绝 {}（{}）：strict 模式仅与配对设备同步", acc.peer.remote.name, ip));
+                        acc.peer.close();
+                        bad_until.insert(ip, Instant::now() + Duration::from_secs(15));
+                    } else {
                     self.cfg.peer_hint = ip.to_string();
                     save_peer_hint(&self.cfg, ip);
                     let peer = acc.peer;
                     self.log(format!("已连接 {ip}（{}）", peer.remote.name.as_str()));
+                    crate::peers::upsert(&self.cfg.state_dir, &peer.remote.node_id, &peer.remote.name, &ip.to_string());
                     peer.spawn_reader(
                         acc.reader,
                         acc.leftover,
@@ -535,6 +558,7 @@ impl Engine {
                     );
                     self.session(peer);
                     self.log("连接结束，重新扫描…");
+                    }
                 }
                 Err(e) => {
                     if e.contains("认证失败") {
@@ -548,6 +572,11 @@ impl Engine {
                 return ClientOutcome::Shutdown;
             }
         }
+    }
+
+    /// strict 配对校验：未设置配对或非 strict 时恒通过
+    fn peer_rejected(&self, node_id: &str) -> bool {
+        !self.preferred_peer.is_empty() && self.strict_peer && node_id != self.preferred_peer
     }
 
     fn tx_up(&self) -> Sender<EngineCmd> {
@@ -602,7 +631,16 @@ impl Engine {
                     sock.set_nodelay(true).ok();
                     match PeerConnection::accept(sock, &peer_opts(&self.cfg)) {
                         Ok(acc) => {
+                            if self.peer_rejected(&acc.peer.remote.node_id) {
+                                self.log(format!(
+                                    "已拒绝 {}（{peer_ip}）：strict 模式仅与配对设备同步",
+                                    acc.peer.remote.name
+                                ));
+                                acc.peer.close();
+                                continue;
+                            }
                             let peer = acc.peer;
+                            crate::peers::upsert(&self.cfg.state_dir, &peer.remote.node_id, &peer.remote.name, &peer_ip);
                             self.log(format!("已接受连接：{peer_ip}（{}）", peer.remote.name));
                             peer.spawn_reader(
                                 acc.reader,
@@ -642,6 +680,7 @@ impl Engine {
                             Ok(acc) => {
                                 demoted = true;
                                 drop(listener);
+                                crate::peers::upsert(&self.cfg.state_dir, &acc.peer.remote.node_id, &acc.peer.remote.name, &ip.to_string());
                                 self.cfg.peer_hint = ip.to_string();
                                 save_peer_hint(&self.cfg, ip);
                                 let peer = acc.peer;
@@ -712,6 +751,30 @@ impl Engine {
             EngineCmd::ClearHistory => {
                 self.history.clear();
                 crate::history::save(&self.cfg.state_dir, &self.history);
+            }
+            EngineCmd::SetPeerPref { node_id, strict } => {
+                if let Some(id) = node_id {
+                    self.preferred_peer = id;
+                }
+                if let Some(s) = strict {
+                    self.strict_peer = s;
+                }
+                crate::peers::save_pref(&self.cfg.state_dir, &self.preferred_peer, self.strict_peer);
+                let mode = if self.strict_peer { "仅与配对设备同步" } else { "优先连接配对设备" };
+                if self.preferred_peer.is_empty() {
+                    self.log("已清除配对");
+                } else {
+                    self.log(format!("配对设置已更新：{mode}"));
+                }
+                // strict 生效时，当前连接若非配对设备则主动断开
+                if self.strict_peer && !self.preferred_peer.is_empty() {
+                    if let Some(conn) = &self.conn {
+                        if conn.remote.node_id != self.preferred_peer {
+                            self.log("当前连接不符合配对设置，已断开");
+                            conn.close();
+                        }
+                    }
+                }
             }
             EngineCmd::ClearInbox => {
                 let (n, bytes) = crate::inbox::clear_inbox(&self.cfg.inbox_dir);

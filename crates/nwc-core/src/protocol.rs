@@ -17,6 +17,24 @@ pub fn new_node_id() -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+/// 设备身份：首次生成后持久化于 state_dir/device_id，重启不变。
+/// （对端列表/配对依赖稳定 ID；同机双实例同 ID，「检测到同一实例」判断照常成立；
+///   换机器/重装 = 新设备，语义正确。随机 ID 无隐私泄漏——握手 hello 是明文的，
+///   不能用 MAC/主机名这类可追踪值）
+pub fn load_or_create_device_id(state_dir: &std::path::Path) -> String {
+    let p = state_dir.join("device_id");
+    if let Ok(s) = std::fs::read_to_string(&p) {
+        let t = s.trim().to_string();
+        if t.len() == 16 && t.chars().all(|c| c.is_ascii_hexdigit()) {
+            return t;
+        }
+    }
+    let id = new_node_id();
+    let _ = std::fs::create_dir_all(state_dir);
+    let _ = std::fs::write(&p, &id);
+    id
+}
+
 /// 对端能力（hello/hello_ack 里可选的 caps 数组；Node 版不发，视为无任何扩展）。
 /// Rust↔Rust 协商出 fileChunk 后大文件分块流式传输，避免整帧 100MB 进内存。
 pub const CAP_FILE_CHUNK: &str = "fileChunk";
