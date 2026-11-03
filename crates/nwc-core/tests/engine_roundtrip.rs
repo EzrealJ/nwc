@@ -9,6 +9,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use nwc_core::config::Config;
+
+/// 引擎级测试互斥：每个测试起 2 个引擎 + 真实 TCP，CI 慢机上并行易抖，
+/// 串行执行换取确定性
+static ENGINE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 use nwc_core::protocol;
 use nwc_core::sync::{ClipEvent, ClipboardWriter, Engine, EngineCmd, EngineEvent, Status};
 
@@ -134,6 +138,7 @@ fn sample_png() -> Vec<u8> {
 
 #[test]
 fn engine_e2e_text_and_image_sync() {
+    let _g = ENGINE_TEST_LOCK.lock().unwrap();
     let port = free_port();
     let server = spawn_node("server", "", port);
     let client = spawn_node("client", "127.0.0.1", port);
@@ -188,9 +193,12 @@ fn engine_e2e_text_and_image_sync() {
     let _ = std::fs::remove_dir_all(&junk_dir);
 }
 
-/// strict 配对：服务端配对为不存在的设备并开启 strict 时，应拒绝其他设备连接
+/// strict 配对：服务端配对为不存在的设备并开启 strict 时，应拒绝其他设备连接。
+/// 协议时序注：TCP 握手双向完成后客户端会瞬态进入 Connected，随后才被服务端断开，
+/// 故断言针对服务端（拒绝日志出现、从未进入会话），而非客户端瞬态状态。
 #[test]
 fn engine_strict_peer_rejects_unpaired() {
+    let _g = ENGINE_TEST_LOCK.lock().unwrap();
     let port = free_port();
     let server = spawn_node_with("server", "", port, |state| {
         std::fs::create_dir_all(state).unwrap();
@@ -202,16 +210,12 @@ fn engine_strict_peer_rejects_unpaired() {
     });
     let client = spawn_node("client", "127.0.0.1", port);
 
-    // 协议时序：TCP 握手双向完成后客户端会瞬态进入 Connected，随后才被服务端断开。
-    // 因此断言针对服务端行为：出现拒绝记录，且从未进入会话（无「已接受连接」）。
-    let deadline = Instant::now() + Duration::from_secs(4);
+    // 轮询等服务端拒绝记录（CI 慢机上引擎启动/扫描/握手更慢，留 15s 余量）
     let mut rejected = false;
     let mut accepted_session = false;
     let mut logs: Vec<String> = Vec::new();
-    loop {
-        if Instant::now() > deadline {
-            break;
-        }
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline && !rejected {
         while let Ok(ev) = server.evt.try_recv() {
             if let EngineEvent::Log(m) = ev {
                 if m.contains("已拒绝") {
@@ -223,12 +227,24 @@ fn engine_strict_peer_rejects_unpaired() {
                 logs.push(m);
             }
         }
-        // 客户端事件持续排空，防止通道积压
-        while let Ok(_) = client.evt.try_recv() {}
+        while client.evt.try_recv().is_ok() {} // 排空客户端通道防积压
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // 拒绝出现后再观察 1s：确认始终没有进入会话
+    let settle = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < settle {
+        while let Ok(ev) = server.evt.try_recv() {
+            if let EngineEvent::Log(m) = ev {
+                if m.contains("已接受连接") {
+                    accepted_session = true;
+                }
+                logs.push(m);
+            }
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(rejected, "服务端应记录拒绝事件；服务端日志: {logs:?}");
-    assert!(!accepted_session, "strict 模式下不应进入会话");
+    assert!(!accepted_session, "strict 模式下不应进入会话；服务端日志: {logs:?}");
 
     shutdown(client);
     shutdown(server);
