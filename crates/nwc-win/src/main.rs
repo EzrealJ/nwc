@@ -23,11 +23,7 @@ mod history_win;
 #[cfg(windows)]
 mod icon;
 #[cfg(windows)]
-mod logger;
-#[cfg(windows)]
 mod restart;
-#[cfg(windows)]
-mod timestamp;
 #[cfg(windows)]
 mod tray;
 
@@ -150,7 +146,22 @@ fn assemble(mut cfg: nwc_core::config::Config) -> (mpsc::Sender<EngineCmd>, mpsc
     let (evt_tx, evt_rx) = mpsc::channel::<EngineEvent>();
 
     let (clip_tx, clip_rx) = mpsc::channel::<nwc_core::sync::ClipEvent>();
-    let clip = clipboard::WinClipboard::start(clip_tx);
+    // 剪贴板诊断（内容识别失败的原因/实际格式列表）→ 引擎事件通道（写成 Warn 日志）
+    let (diag_tx, diag_rx) = mpsc::channel::<String>();
+    let clip = clipboard::WinClipboard::start(clip_tx, Some(diag_tx));
+    {
+        let evt_tx2 = evt_tx.clone();
+        std::thread::Builder::new()
+            .name("nwc-clip-diag".into())
+            .spawn(move || {
+                while let Ok(m) = diag_rx.recv() {
+                    if evt_tx2.send(EngineEvent::Warn(m)).is_err() {
+                        break;
+                    }
+                }
+            })
+            .ok();
+    }
     {
         let fwd = cmd_tx.clone();
         std::thread::Builder::new()
@@ -184,7 +195,7 @@ fn assemble(mut cfg: nwc_core::config::Config) -> (mpsc::Sender<EngineCmd>, mpsc
 fn run_console(cfg: nwc_core::config::Config) -> i32 {
     let (_cmd_tx, evt_rx, clip) = assemble(cfg);
     while let Ok(ev) = evt_rx.recv() {
-        let ts = timestamp::now_hms();
+        let ts = nwc_core::timestamp::now_hms();
         match ev {
             EngineEvent::Log(m) => println!("[{ts}] {m}"),
             EngineEvent::Warn(m) => println!("[{ts}] [警告] {m}"),
@@ -212,7 +223,7 @@ fn status_label(s: &Status) -> String {
 /// 托盘模式：文件日志 + 托盘 + 状态/气泡转发
 #[cfg(windows)]
 fn run_gui(cfg: nwc_core::config::Config) -> i32 {
-    let log_file = logger::FileLogger::new(&cfg.state_dir);
+    let log_file = nwc_core::logger::FileLogger::new(&cfg.state_dir);
     log_file.prune(7);
 
     let cfg_path = cfg.state_dir.join("config.json");
@@ -234,7 +245,7 @@ fn run_gui(cfg: nwc_core::config::Config) -> i32 {
         loop {
             match evt_rx.recv() {
                 Ok(ev) => {
-                    let ts = timestamp::now_hms();
+                    let ts = nwc_core::timestamp::now_hms();
                     match ev {
                         EngineEvent::Log(m) => log_file.write(&format!("[{ts}] {m}")),
                         EngineEvent::Warn(m) => log_file.write(&format!("[{ts}] [警告] {m}")),

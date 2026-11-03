@@ -3,7 +3,7 @@
 //! - 变更检测：changeCount 进程内轮询（NSPasteboard 无通知 API，但相比 Node 版
 //!   每 400ms spawn 4-6 个 osascript/pbpaste/sips 子进程，这里是零子进程、微秒级读取）
 //! - 读：文件（NSFilenames）> 文本 > 图片（PNGf 优先原始字节，TIFF/JPEG 经 ImageIO 转 PNG）
-//! - 写：文本 / PNGf（原始 PNG 字节直接写入，无重编码损耗）/ 文件列表（writeObjects NSURL）
+//! - 写：文本 / 图片（public.tiff + public.png + PNGf 三格式，PNG 原始字节直写无重编码损耗）/ 文件列表（writeObjects NSURL）
 //! - 回声：写后取 changeCount 基线 + 1500ms suppress（对应 Node 版 macos.js）
 
 #![cfg(target_os = "macos")]
@@ -228,18 +228,16 @@ unsafe fn read_image_png() -> Option<Vec<u8>> {
     // TIFF/JPEG → ImageIO 转 PNG
     if let Some(t) = find("tiff").or_else(|| find("jpeg")).or_else(|| find("public.jpeg")) {
         if let Some(data) = pb.dataForType(&t) {
-            return convert_to_png(&data);
+            return convert_image(&data, "public.png");
         }
     }
     None
 }
 
-/// ImageIO：CGImageSource → CGImageDestination(PNG)
-unsafe fn convert_to_png(data: &Retained<NSData>) -> Option<Vec<u8>> {
-    use objc2::rc::Retained;
+/// ImageIO 通用转码：CGImageSource(任意支持的格式) → CGImageDestination(dst_uti)。
+/// 读取方向 TIFF/JPEG → PNG；写入方向 PNG → TIFF（供 write_image_png 挂多格式用）。
+unsafe fn convert_image(data: &Retained<NSData>, dst_uti: &str) -> Option<Vec<u8>> {
     #[allow(non_snake_case)]
-    #[repr(C)]
-    struct CFDictionary(std::ffi::c_void);
     unsafe extern "C" {
         fn CGImageSourceCreateWithData(data: *const std::ffi::c_void, opts: *const std::ffi::c_void) -> *mut std::ffi::c_void;
         fn CGImageDestinationCreateWithData(dst: *const std::ffi::c_void, uti: *const std::ffi::c_void, count: usize, opts: *const std::ffi::c_void) -> *mut std::ffi::c_void;
@@ -249,7 +247,6 @@ unsafe fn convert_to_png(data: &Retained<NSData>) -> Option<Vec<u8>> {
         fn CFDataGetBytePtr(data: *const std::ffi::c_void) -> *const u8;
         fn CFDataGetLength(data: *const std::ffi::c_void) -> usize;
         fn CFRelease(cf: *const std::ffi::c_void);
-        fn UTTypeCreatePreferredIdentifierForTag(tag: *const std::ffi::c_void, str_: *const std::ffi::c_void, bundle: *const std::ffi::c_void) -> *mut std::ffi::c_void;
     }
     let src = CGImageSourceCreateWithData(Retained::as_ptr(data) as *const std::ffi::c_void, std::ptr::null());
     if src.is_null() {
@@ -260,9 +257,10 @@ unsafe fn convert_to_png(data: &Retained<NSData>) -> Option<Vec<u8>> {
         CFRelease(src);
         return None;
     }
-    // "public.png" UTI 常量字符串（UTF-16 LE C-string）
-    let png_uti: Vec<u16> = "public.png".encode_utf16().chain(std::iter::once(0)).collect();
-    let dst = CGImageDestinationCreateWithData(mut_data, png_uti.as_ptr() as *const _, 1, std::ptr::null());
+    // 目标 UTI：NSString 与 CFStringRef toll-free bridge，直接传对象指针
+    // （不能传裸 UTF-16 数组——那不是 CF 对象，CoreFoundation 会 __CF_IS_OBJC 断言崩溃）
+    let uti = NSString::from_str(dst_uti);
+    let dst = CGImageDestinationCreateWithData(mut_data, Retained::as_ptr(&uti) as *const _, 1, std::ptr::null());
     if dst.is_null() {
         CFRelease(mut_data);
         CFRelease(src);
@@ -285,8 +283,6 @@ unsafe fn convert_to_png(data: &Retained<NSData>) -> Option<Vec<u8>> {
     let ptr = CFDataGetBytePtr(mut_data);
     let out = std::slice::from_raw_parts(ptr, len).to_vec();
     CFRelease(mut_data);
-    let _: Option<CFDictionary> = None;
-    let _ = Retained::<NSString>::retain; // 引用占位
     Some(out)
 }
 
@@ -297,14 +293,24 @@ unsafe fn write_text(s: &str) -> bool {
     pb.setString_forType(&NSString::from_str(s), &ns)
 }
 
+/// 写图片：同时挂 TIFF + PNG 原始字节 + 旧式 PNGf。
+/// public.tiff 是 mac 应用粘贴图片的事实标准（NSImage 写剪贴板的默认类型），
+/// 只写 public.png 时不少应用（聊天软件/旧 App）Cmd+V 读不到内容；
+/// 这里对齐 Windows 端「PNG + CF_DIBV5 双格式」的兼容做法。TIFF 由 ImageIO 从 PNG 转出。
 unsafe fn write_image_png(png: &[u8]) -> bool {
     if !nwc_core::util::is_png(png) {
         return false;
     }
     let pb = general();
-    let data = NSData::with_bytes(png);
     pb.clearContents();
-    pb.setData_forType(Some(&data), &NSString::from_str("public.png"))
+    let png_data = NSData::with_bytes(png);
+    let mut ok = false;
+    if let Some(tiff) = convert_image(&png_data, "public.tiff") {
+        ok |= pb.setData_forType(Some(&NSData::with_bytes(&tiff)), &NSString::from_str("public.tiff"));
+    }
+    ok |= pb.setData_forType(Some(&png_data), &NSString::from_str("public.png"));
+    ok |= pb.setData_forType(Some(&png_data), &NSString::from_str("PNGf"));
+    ok
 }
 
 unsafe fn write_files(paths: &[PathBuf]) -> bool {
@@ -321,4 +327,55 @@ unsafe fn write_files(paths: &[PathBuf]) -> bool {
     let pb = general();
     pb.clearContents();
     pb.writeObjects(&arr)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 1x1 红色不透明 PNG（字节由脚本生成，确定性内容）
+    const TINY_PNG_B64: &str =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+
+    fn tiny_png() -> Vec<u8> {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.decode(TINY_PNG_B64).unwrap()
+    }
+
+    /// 写入应同时挂 public.tiff / public.png / PNGf 三种类型，且能按各自类型读回
+    /// （注意：会动真实系统剪贴板，仅在手动跑 `cargo test -p nwc-mac` 时执行）
+    #[test]
+    fn write_image_sets_tiff_png_pngf() {
+        let png = tiny_png();
+        objc2::rc::autoreleasepool(|_pool| unsafe {
+            assert!(write_image_png(&png), "写入应返回成功");
+
+            let pb = general();
+            let types: Vec<String> = pb.types().unwrap().to_vec().iter().map(|t| t.to_string()).collect();
+            assert!(types.iter().any(|t| t.contains("tiff")), "缺少 TIFF 类型: {types:?}");
+            assert!(types.iter().any(|t| t == "public.png"), "缺少 public.png: {types:?}");
+
+            // TIFF 类型可解出位图（说明 ImageIO 转码成功而非空数据）
+            let tiff_type = NSString::from_str("public.tiff");
+            let tiff = pb.dataForType(&tiff_type).expect("TIFF 数据应存在");
+            assert!(tiff.len() > 8, "TIFF 数据过短: {} 字节", tiff.len());
+
+            // 回读：read_image_png 优先 PNGf/public.png 原始字节，应得到与写入一致的 PNG
+            let back = read_image_png().expect("应能读回图片");
+            assert_eq!(back, png, "回读 PNG 应与写入字节一致");
+        });
+    }
+
+    /// TIFF→PNG 方向（读取路径）：写入的 TIFF 数据应可被 convert_image 解回 PNG
+    #[test]
+    fn tiff_roundtrip_via_imageio() {
+        let png = tiny_png();
+        objc2::rc::autoreleasepool(|_pool| unsafe {
+            let tiff = convert_image(&NSData::with_bytes(&png), "public.tiff").expect("PNG→TIFF 应成功");
+            let back = convert_image(&NSData::with_bytes(&tiff), "public.png").expect("TIFF→PNG 应成功");
+            assert!(nwc_core::util::is_png(&back));
+            // 1x1 不透明红点回读后仍应是合法 PNG（宽高一致由 ImageIO 保证，这里验证签名即可）
+            assert_eq!(&back[..8], &png[..8]);
+        });
+    }
 }

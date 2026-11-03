@@ -394,6 +394,11 @@ impl Engine {
 
         let escalate = self.cfg.role != "client" && can_listen;
         loop {
+            // Shutdown 是一次性命令（可能已被 session/scan_for_peer 消费），
+            // 全局 stop 标志是各循环统一的退出依据（否则引擎线程残留、壳层跟着挂）
+            if self.stop.load(Ordering::SeqCst) {
+                return;
+            }
             if mode == "server" {
                 if !self.server_phase() {
                     return; // Shutdown
@@ -416,6 +421,9 @@ impl Engine {
     fn scan_for_peer(&mut self, budget_ms: u64) -> Option<Ipv4Addr> {
         let deadline = Instant::now() + Duration::from_millis(budget_ms.max(100));
         loop {
+            if self.stop.load(Ordering::SeqCst) {
+                return None;
+            }
             if let Some(ip) = self.find_peers() {
                 return Some(ip);
             }
@@ -448,6 +456,9 @@ impl Engine {
         let mut bad_until: HashMap<Ipv4Addr, Instant> = HashMap::new();
         let mut misses: u32 = 0;
         loop {
+            if self.stop.load(Ordering::SeqCst) {
+                return ClientOutcome::Shutdown;
+            }
             if matches!(self.pump(Duration::from_millis(200)), PumpResult::Shutdown) {
                 return ClientOutcome::Shutdown;
             }
@@ -537,6 +548,9 @@ impl Engine {
         let mut demote_fail_until = Instant::now();
         let mut next_scan = Instant::now() + Duration::from_millis(self.cfg.scan_interval_ms);
         loop {
+            if self.stop.load(Ordering::SeqCst) {
+                return false;
+            }
             if matches!(self.pump(Duration::from_millis(80)), PumpResult::Shutdown) {
                 return false;
             }
@@ -1184,6 +1198,8 @@ impl Engine {
                 self.echo.remember(&sha256_hex(&payload));
                 if self.writer.set_image(&payload) {
                     self.log(format!("↓ 已接收图片（{}）", fmt_bytes(payload.len() as u64)));
+                } else {
+                    self.warn("写入本地剪贴板失败（图片）");
                 }
             }
             "file" => self.recv_single_file(&header, &payload),
@@ -1546,6 +1562,8 @@ impl Engine {
         if self.writer.set_files(&items) {
             let names: Vec<String> = items.iter().map(|p| file_name_of(p)).collect();
             self.log(format!("↓ 已存入收件箱并设为剪贴板文件列表（共 {} 项）：{}", items.len(), names.join("、")));
+            let brief: String = names.join("、").chars().take(100).collect();
+            self.notify("收到文件", format!("共 {} 项已存入收件箱：{}", items.len(), brief));
         } else {
             let names: Vec<String> = items.iter().map(|p| file_name_of(p)).collect();
             self.warn(format!("已存入收件箱，但写入剪贴板文件列表失败：{}", names.join("、")));

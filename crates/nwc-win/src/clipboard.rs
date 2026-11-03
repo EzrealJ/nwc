@@ -47,6 +47,8 @@ pub struct WinClipboard {
 
 struct Inner {
     tx: Sender<ClipEvent>,
+    /// 诊断日志通道（剪贴板变化但内容识别失败时上报格式列表/原因，壳层写日志）
+    diag: Option<Sender<String>>,
     /// 自己写入后的剪贴板序列号：相同则吸收
     self_seq: Mutex<u64>,
     /// 内容令牌（读回形态）+ 记录时间
@@ -95,11 +97,13 @@ impl nwc_core::sync::ClipboardWriter for WinClipboard {
 }
 
 impl WinClipboard {
-    /// 启动剪贴板监听线程；事件经 tx 上抛（等窗口就绪后返回）
-    pub fn start(tx: Sender<ClipEvent>) -> Arc<WinClipboard> {
+    /// 启动剪贴板监听线程；事件经 tx 上抛（等窗口就绪后返回）。
+    /// diag 可选：识别失败时上报诊断信息（格式列表/解码失败原因）
+    pub fn start(tx: Sender<ClipEvent>, diag: Option<Sender<String>>) -> Arc<WinClipboard> {
         let clip = Arc::new(WinClipboard {
             inner: Arc::new(Inner {
                 tx,
+                diag,
                 self_seq: Mutex::new(0),
                 token: Mutex::new((String::new(), None)),
             }),
@@ -228,11 +232,66 @@ fn on_clipboard_update(inner: &Inner) {
         }
         return;
     }
-    if let Some(png) = read_image_png() {
+    if let Some(png) = read_image_png(inner) {
         let tok = format!("i:{}", nwc_core::util::sha256_hex(&png));
         if !inner.token_hit(&tok) {
             inner.token_remember(&tok);
             let _ = inner.tx.send(ClipEvent::Image(png));
+        }
+        return;
+    }
+    // 三类内容都没识别出来：上报剪贴板实际格式列表（排查“复制了却没同步”的关键线索）
+    inner.diag_report(|| format!("剪贴板变化但未识别出可同步内容，现有格式: {}", enumerate_format_names()));
+}
+
+impl Inner {
+    fn diag_report(&self, msg: impl FnOnce() -> String) {
+        if let Some(d) = &self.diag {
+            let _ = d.send(msg());
+        }
+    }
+}
+
+/// 枚举剪贴板当前全部格式（标准格式给名字，注册格式取注册名）
+fn enumerate_format_names() -> String {
+    use windows::Win32::System::DataExchange::{CloseClipboard, EnumClipboardFormats, GetClipboardFormatNameW, OpenClipboard};
+    unsafe {
+        if !OpenClipboard(None).is_ok() {
+            return "(打开剪贴板失败)".into();
+        }
+        let mut out: Vec<String> = Vec::new();
+        let mut f: u32 = 0;
+        loop {
+            f = EnumClipboardFormats(f);
+            if f == 0 {
+                break;
+            }
+            let name = match f {
+                1 => "CF_TEXT".into(),
+                2 => "CF_BITMAP".into(),
+                3 => "CF_METAFILEPICT".into(),
+                7 => "CF_OEMTEXT".into(),
+                8 => "CF_DIB".into(),
+                13 => "CF_UNICODETEXT".into(),
+                15 => "CF_HDROP".into(),
+                17 => "CF_DIBV5".into(),
+                _ => {
+                    let mut buf = [0u16; 128];
+                    let n = GetClipboardFormatNameW(f, &mut buf);
+                    if n > 0 {
+                        String::from_utf16_lossy(&buf[..n as usize])
+                    } else {
+                        format!("#{f}")
+                    }
+                }
+            };
+            out.push(name);
+        }
+        let _ = CloseClipboard();
+        if out.is_empty() {
+            "(空)".into()
+        } else {
+            out.join(", ")
         }
     }
 }
@@ -313,8 +372,9 @@ fn register_png_format() -> CLIPBOARD_FORMAT {
     CLIPBOARD_FORMAT(unsafe { RegisterClipboardFormatW(PCWSTR(name.as_ptr())) } as u16)
 }
 
-/// 读图：优先注册格式 "PNG"（原始字节），回退 CF_DIBV5 / CF_DIB 转 PNG
-fn read_image_png() -> Option<Vec<u8>> {
+/// 读图：优先注册格式 "PNG"（原始字节），回退 CF_DIBV5 / CF_DIB 转 PNG。
+/// 失败路径经 inner.diag 上报原因（识别不了至少留线索）
+fn read_image_png(inner: &Inner) -> Option<Vec<u8>> {
     let png_fmt = register_png_format();
     if let Some(bytes) = with_open_clipboard(OPEN_RETRY_READ, || unsafe {
         if !IsClipboardFormatAvailable(png_fmt.0 as u32).is_ok() {
@@ -326,8 +386,9 @@ fn read_image_png() -> Option<Vec<u8>> {
         if nwc_core::util::is_png(&bytes) {
             return Some(bytes);
         }
+        inner.diag_report(|| format!("PNG 格式数据 {} 字节但无 PNG 签名，已跳过", bytes.len()));
     }
-    for (fmt, v5) in [(CF_DIBV5, true), (CF_DIB, false)] {
+    for fmt in [CF_DIBV5, CF_DIB] {
         let bytes = with_open_clipboard(OPEN_RETRY_READ, || unsafe {
             if !IsClipboardFormatAvailable(fmt.0 as u32).is_ok() {
                 return None;
@@ -336,8 +397,14 @@ fn read_image_png() -> Option<Vec<u8>> {
             copy_hglobal(h)
         });
         if let Some(bytes) = bytes {
-            if let Some(png) = dib_to_png(&bytes, v5) {
-                return Some(png);
+            match nwc_core::dib::dib_to_png(&bytes) {
+                Some(png) => return Some(png),
+                None => inner.diag_report(|| {
+                    format!(
+                        "DIB 转码失败（{}），当前仅支持 24/32bpp BI_RGB/BI_BITFIELDS",
+                        nwc_core::dib::describe(&bytes)
+                    )
+                }),
             }
         }
     }
@@ -435,7 +502,7 @@ fn write_image(png_bytes: &[u8]) -> bool {
     if !nwc_core::util::is_png(png_bytes) {
         return false;
     }
-    let Some(dib) = png_to_dibv5(png_bytes) else { return false };
+    let Some(dib) = nwc_core::dib::png_to_dibv5(png_bytes) else { return false };
     with_open_clipboard(OPEN_RETRY_WRITE, || unsafe {
         if EmptyClipboard().is_err() {
             return None;
@@ -454,145 +521,4 @@ fn write_image(png_bytes: &[u8]) -> bool {
         Some(true)
     })
     .unwrap_or(false)
-}
-
-// ---- 图像转换（png crate，纯 Rust） ----
-
-/// 从字节切片安全读小端 u32/i32
-fn rd32(b: &[u8], off: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(b.get(off..off + 4)?.try_into().ok()?))
-}
-
-/// 位掩码提取并归一到 0..255
-fn mask_extract(v: u32, mask: u32) -> u8 {
-    if mask == 0 {
-        return 0;
-    }
-    let shift = mask.trailing_zeros();
-    let count = mask.count_ones();
-    let raw = (v & mask) >> shift;
-    if count >= 8 {
-        (raw >> (count - 8)) as u8
-    } else {
-        ((raw.saturating_mul(255)) / ((1u32 << count) - 1).max(1)) as u8
-    }
-}
-
-/// DIB(V5) → PNG。
-/// BITMAPV5HEADER 偏移：Size@0 Width@4 Height@8 Planes@12 BitCount@16 Compression@20
-/// ClrUsed@36 RedMask@44 GreenMask@48 BlueMask@52 AlphaMask@56（头大小 124）。
-/// 支持 24/32bpp BI_RGB 与 BI_BITFIELDS；自底向上/自顶向下。
-fn dib_to_png(dib: &[u8], v5: bool) -> Option<Vec<u8>> {
-    let hdr_len = if v5 { 124 } else { 40 };
-    if dib.len() < hdr_len {
-        return None;
-    }
-    let width = rd32(dib, 4)? as i32;
-    let width = width.unsigned_abs() as usize;
-    let height_raw = rd32(dib, 8)? as i32;
-    let (height, top_down) = if height_raw < 0 {
-        (height_raw.unsigned_abs() as usize, true)
-    } else {
-        (height_raw as usize, false)
-    };
-    let planes = rd32(dib, 12)?;
-    let bpp = rd32(dib, 16)? as usize;
-    let compression = rd32(dib, 20)?;
-    let clr_used = rd32(dib, 36)? as usize;
-    if planes != 1 || (bpp != 24 && bpp != 32) || (compression != 0 && compression != 3) || width == 0 || height == 0 {
-        return None;
-    }
-    let (rm, gm, bm, am) = if v5 {
-        (
-            rd32(dib, 44).unwrap_or(0x00FF0000),
-            rd32(dib, 48).unwrap_or(0x0000FF00),
-            rd32(dib, 52).unwrap_or(0x000000FF),
-            rd32(dib, 56).unwrap_or(0),
-        )
-    } else if compression == 3 {
-        // 掩码在 BITMAPINFOHEADER 之后的 3 个 DWORD
-        (
-            rd32(dib, 40)?,
-            rd32(dib, 44)?,
-            rd32(dib, 48)?,
-            0u32,
-        )
-    } else if bpp == 32 {
-        (0x00FF0000, 0x0000FF00, 0x000000FF, 0)
-    } else {
-        (0, 0, 0, 0) // 24bpp 固定 BGR 序
-    };
-    let px_off = hdr_len
-        + if !v5 && compression == 3 { 12 } else { 0 }
-        + clr_used * 4;
-    let stride = (width * bpp / 8 + 3) & !3usize;
-    let px = dib.get(px_off..)?;
-    if px.len() < stride * height {
-        return None;
-    }
-    let mut rgba: Vec<u8> = Vec::with_capacity(width * height * 4);
-    for row in 0..height {
-        let y = if top_down { row } else { height - 1 - row };
-        let line = &px[y * stride..y * stride + width * bpp / 8];
-        for x in 0..width {
-            let p = &line[x * bpp / 8..x * bpp / 8 + bpp / 8];
-            if bpp == 24 {
-                rgba.extend_from_slice(&[p[2], p[1], p[0], 255]);
-            } else {
-                let v = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
-                let a = if am != 0 { mask_extract(v, am) } else { 255 };
-                rgba.extend_from_slice(&[mask_extract(v, rm), mask_extract(v, gm), mask_extract(v, bm), a]);
-            }
-        }
-    }
-    encode_png(width as u32, height as u32, &rgba)
-}
-
-/// PNG → BITMAPV5HEADER + 自底向上 BGRA 像素
-fn png_to_dibv5(png_bytes: &[u8]) -> Option<Vec<u8>> {
-    let dec = png::Decoder::new(std::io::Cursor::new(png_bytes));
-    let mut reader = dec.read_info().ok()?;
-    let mut buf = vec![0u8; reader.output_buffer_size()];
-    let info = reader.next_frame(&mut buf).ok()?;
-    let (w, h) = (info.width as usize, info.height as usize);
-    let rgba = &buf[..info.buffer_size()];
-    let stride = (w * 4 + 3) & !3usize;
-    let mut dib = vec![0u8; 124 + stride * h];
-    dib[0..4].copy_from_slice(&124u32.to_le_bytes());
-    dib[4..8].copy_from_slice(&(w as u32).to_le_bytes());
-    dib[8..12].copy_from_slice(&(h as u32).to_le_bytes()); // 正数 = 自底向上
-    dib[12..16].copy_from_slice(&1u32.to_le_bytes());
-    dib[16..20].copy_from_slice(&32u32.to_le_bytes());
-    dib[20..24].copy_from_slice(&0u32.to_le_bytes()); // BI_RGB
-    dib[24..28].copy_from_slice(&((stride * h) as u32).to_le_bytes());
-    dib[36..40].copy_from_slice(&0u32.to_le_bytes()); // ClrUsed
-    dib[44..48].copy_from_slice(&0x00FF0000u32.to_le_bytes()); // RedMask
-    dib[48..52].copy_from_slice(&0x0000FF00u32.to_le_bytes()); // GreenMask
-    dib[52..56].copy_from_slice(&0x000000FFu32.to_le_bytes()); // BlueMask
-    dib[56..60].copy_from_slice(&0xFF000000u32.to_le_bytes()); // AlphaMask
-    dib[60..64].copy_from_slice(&0x73524742u32.to_le_bytes()); // LCS_sRGB
-    dib[112..116].copy_from_slice(&4u32.to_le_bytes()); // LCS_GM_IMAGES intent
-    for row in 0..h {
-        let src = &rgba[row * w * 4..(row + 1) * w * 4];
-        let dst = &mut dib[124 + (h - 1 - row) * stride..124 + (h - 1 - row) * stride + w * 4];
-        for x in 0..w {
-            dst[x * 4] = src[x * 4 + 2];
-            dst[x * 4 + 1] = src[x * 4 + 1];
-            dst[x * 4 + 2] = src[x * 4];
-            dst[x * 4 + 3] = src[x * 4 + 3];
-        }
-    }
-    Some(dib)
-}
-
-fn encode_png(w: u32, h: u32, rgba: &[u8]) -> Option<Vec<u8>> {
-    let mut out = Vec::new();
-    {
-        let mut enc = png::Encoder::new(&mut out, w, h);
-        enc.set_color(png::ColorType::Rgba);
-        enc.set_depth(png::BitDepth::Eight);
-        let mut writer = enc.write_header().ok()?;
-        writer.write_image_data(rgba).ok()?;
-    }
-    Some(out)
 }

@@ -61,6 +61,31 @@ jobs:
           if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then TAG="${INPUT_TAG:?}"; else TAG="$GITHUB_REF_NAME"; fi
           mkdir -p dist
           tar -a -cf "dist/NetWorkClipboard-$TAG-macos-${{ matrix.arch }}.zip" -C "target/${{ matrix.target }}/release" nwc-mac
+          # .app bundle（Finder 双击即用；裸二进制仅适合终端调试）
+          VER="${TAG#v}"
+          APP="NetWorkClipboard.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp "target/${{ matrix.target }}/release/nwc-mac" "$APP/Contents/MacOS/nwc-mac"
+          cat > "$APP/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleName</key><string>NetWorkClipboard</string>
+            <key>CFBundleDisplayName</key><string>NetWorkClipboard</string>
+            <key>CFBundleIdentifier</key><string>com.ezrealj.nwc</string>
+            <key>CFBundleExecutable</key><string>nwc-mac</string>
+            <key>CFBundleVersion</key><string>$VER</string>
+            <key>CFBundleShortVersionString</key><string>$VER</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>LSUIElement</key><true/>
+            <key>NSLocalNetworkUsageDescription</key><string>NetWorkClipboard 需要访问本地网络来发现并连接你的另一台电脑，同步剪贴板。</string>
+          </dict>
+          </plist>
+          PLIST
+          codesign -s - --force "$APP" || true
+          tar -a -cf "dist/NetWorkClipboard-$TAG-macos-${{ matrix.arch }}-app.zip" "$APP"
       - uses: actions/upload-artifact@v4
         with:
           name: macos-${{ matrix.arch }}

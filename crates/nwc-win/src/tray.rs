@@ -361,6 +361,12 @@ unsafe fn show_menu(ctx: &TrayCtx, hwnd: HWND) {
             nid.uID = 1;
             let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
             PostQuitMessage(0);
+            // 兜底：引擎线程若恰在长传输/扫描，正常退出链路可能延迟；
+            // 给 500ms 清理（接收批次/状态文件），随后强制结束进程（对齐 mac 端 quitApp）
+            std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                std::process::exit(0);
+            });
         }
         _ => {}
     }

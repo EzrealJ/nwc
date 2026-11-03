@@ -63,6 +63,7 @@ fn main() {
 
     let cfg_path = cfg.state_dir.join("config.json");
     let inbox_dir = cfg.inbox_dir.clone();
+    let state_dir = cfg.state_dir.clone();
     let mut engine = Engine::new(cfg, writer, ifaces, cmd_rx, evt_tx);
     engine.set_cmd_sender(cmd_tx.clone());
     std::thread::Builder::new()
@@ -81,8 +82,39 @@ fn main() {
             }
         }
     } else {
-        // 菜单栏模式（主线程跑 AppKit）
-        statusbar::run(cmd_tx, evt_rx, inbox_dir, cfg_path);
+        // 菜单栏模式单实例：state_dir/instance.lock 加 flock（进程退出自动释放）。
+        // 双实例会互抢剪贴板回声抑制，必须拦下（对齐 Windows 端的命名互斥量）。
+        let _single_lock = match acquire_single_instance(&state_dir) {
+            Some(f) => f,
+            None => {
+                let _ = std::process::Command::new("osascript")
+                    .arg("-e")
+                    .arg("display alert \"NetWorkClipboard 已在运行（见菜单栏）\"")
+                    .status();
+                return;
+            }
+        };
+        // 菜单栏模式（主线程跑 AppKit）：GUI 无控制台，日志落文件（按天滚动、保留 7 天）
+        let logger = nwc_core::logger::FileLogger::new(&state_dir);
+        logger.prune(7);
+        let log_path = logger.latest_path();
+        statusbar::run(cmd_tx, evt_rx, inbox_dir, cfg_path, logger, log_path);
+    }
+}
+
+#[cfg(target_os = "macos")]
+/// 菜单栏模式单实例锁：flock(state_dir/instance.lock)，返回 Some(句柄) = 本机首个实例。
+/// 句柄须在 main 作用域持有；进程退出（含崩溃）时内核自动释放锁。
+fn acquire_single_instance(state_dir: &std::path::Path) -> Option<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    let _ = std::fs::create_dir_all(state_dir);
+    let f = std::fs::File::create(state_dir.join("instance.lock")).ok()?;
+    let fd = f.as_raw_fd();
+    let r = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+    if r == 0 {
+        Some(f)
+    } else {
+        None
     }
 }
 

@@ -278,22 +278,27 @@ dependencies = [
 
 [[package]]
 name = "nwc-core"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "aes-gcm",
  "base64",
  "getrandom",
+ "libc",
+ "png",
  "regex",
  "scrypt",
  "serde",
  "serde_json",
  "sha2",
+ "windows",
 ]
 
 [[package]]
 name = "nwc-mac"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
+ "base64",
+ "libc",
  "nwc-core",
  "objc2",
  "objc2-app-kit",
@@ -302,10 +307,9 @@ dependencies = [
 
 [[package]]
 name = "nwc-win"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "nwc-core",
- "png",
  "serde_json",
  "windows",
  "winreg",

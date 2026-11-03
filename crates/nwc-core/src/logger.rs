@@ -1,7 +1,5 @@
-//! 文件日志：~/.networkclipboard/logs/nwc-YYYY-MM-DD.log，按天滚动、保留 7 天
-//! （GUI 模式没有控制台，日志的去处；--cli 模式只出控制台）
-
-#![cfg(windows)]
+//! 文件日志：~/.networkclipboard/logs/nwc-YYYY-MM-DD.log，按天滚动、保留 7 天。
+//! 两端 GUI 模式共用（没有控制台，日志的去处；--cli 模式只出控制台）。
 
 use std::fs;
 use std::io::Write;
@@ -34,7 +32,7 @@ impl FileLogger {
             }
         }
         if let Some(f) = st.1.as_mut() {
-            let _ = writeln!(f, "{}", line);
+            let _ = writeln!(f, "{line}");
         }
     }
 

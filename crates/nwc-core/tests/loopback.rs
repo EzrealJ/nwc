@@ -146,3 +146,90 @@ fn rust_to_rust_caps_negotiated() {
     let acc = PeerConnection::connect("127.0.0.1", port, &co).unwrap();
     assert!(acc.peer.remote.has_cap(protocol::CAP_FILE_CHUNK), "应协商出 fileChunk 能力");
 }
+
+/// 回归：连接活跃期间收到 Shutdown，engine.run() 必须能返回
+/// （旧 bug：Shutdown 是一次性命令，被 session() 消费后外层循环再也看不到，
+///  引擎线程卡死 → 壳层等事件通道关闭也跟着挂 → 点托盘“退出”进程残留）
+#[test]
+fn engine_shutdown_during_session_exits() {
+    use std::sync::mpsc;
+    use nwc_core::config::Config;
+    use nwc_core::sync::{ClipEvent, ClipboardWriter, Engine, EngineCmd, EngineEvent, Status};
+
+    struct NoopWriter;
+    impl ClipboardWriter for NoopWriter {
+        fn set_text(&self, _s: &str) -> bool { true }
+        fn set_image(&self, _p: &[u8]) -> bool { true }
+        fn set_files(&self, _p: &[std::path::PathBuf]) -> bool { true }
+    }
+
+    let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = l.local_addr().unwrap().port();
+    drop(l);
+
+    let tmp = std::env::temp_dir().join(format!("nwc-shutdown-{}", std::process::id()));
+    let mk_cfg = |role: &str, target: &str| {
+        let mut c = Config::default();
+        c.node_id = protocol::new_node_id(); // 两端必须不同，否则握手判“同一实例”
+        c.port = port;
+        c.token = "t".into();
+        c.role = role.into();
+        c.target = target.into();
+        c.state_dir = tmp.join(role);
+        c.inbox_dir = tmp.join(role).join("inbox");
+        c.scan_interval_ms = 100;
+        c.startup_scan_ms = 100;
+        c.heartbeat_ms = 1000;
+        c.heartbeat_timeout_ms = 5000;
+        c.allow_listen = Some(true);
+        c
+    };
+
+    let spawn_engine = |cfg: Config| -> (mpsc::Sender<EngineCmd>, mpsc::Receiver<EngineEvent>, mpsc::Receiver<()>) {
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (evt_tx, evt_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let mut engine = Engine::new(
+            cfg,
+            Arc::new(NoopWriter),
+            Box::new(Vec::new),
+            cmd_rx,
+            evt_tx,
+        );
+        engine.set_cmd_sender(cmd_tx.clone());
+        let fwd = cmd_tx.clone();
+        std::thread::spawn(move || {
+            // 无剪贴板源：直接喂一个无害事件让管线跑起来即可（省去平台层）
+            let _ = fwd.send(EngineCmd::Clip(ClipEvent::Text("boot".into())));
+            engine.run();
+            let _ = done_tx.send(());
+        });
+        (cmd_tx, evt_rx, done_rx)
+    };
+
+    let (s_tx, s_evt, s_done) = spawn_engine(mk_cfg("server", ""));
+    let (c_tx, c_evt, c_done) = spawn_engine(mk_cfg("client", "127.0.0.1"));
+
+    // 等客户端进入已连接（最多 8 秒）
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let connected = loop {
+        if Instant::now() > deadline { break false; }
+        match c_evt.recv_timeout(Duration::from_millis(200)) {
+            Ok(EngineEvent::Status(Status::Connected(_))) => break true,
+            Ok(_) => continue,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break false,
+        }
+    };
+    assert!(connected, "回环连接应建立（否则后续断言无意义）");
+
+    // 连接活跃时发 Shutdown：run() 必须在 3 秒内返回
+    c_tx.send(EngineCmd::Shutdown).unwrap();
+    let exited = c_done.recv_timeout(Duration::from_secs(3)).is_ok();
+    assert!(exited, "连接期间收到 Shutdown，engine.run() 应能返回（旧实现卡死在 session→外层循环）");
+
+    // 收尾：让服务端也退出
+    let _ = s_tx.send(EngineCmd::Shutdown);
+    let _ = s_done.recv_timeout(Duration::from_secs(3));
+    let _ = std::fs::remove_dir_all(&tmp);
+}
