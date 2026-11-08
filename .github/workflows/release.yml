@@ -24,11 +24,26 @@ jobs:
       - run: cargo test -p nwc-core
       - run: cargo build --release -p nwc-win
       - name: 打包
+        shell: pwsh
+        run: |
+          $TAG = if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') { $env:INPUT_TAG } else { $env:GITHUB_REF_NAME }
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path target/release/nwc.exe -DestinationPath "dist/NetWorkClipboard-$TAG-win-x64.zip"
+      - name: 校验 zip 格式
         shell: bash
         run: |
-          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then TAG="${INPUT_TAG:?}"; else TAG="$GITHUB_REF_NAME"; fi
-          mkdir -p dist
-          tar -a -cf "dist/NetWorkClipboard-$TAG-win-x64.zip" -C target/release nwc.exe
+          PY=python3; command -v python3 >/dev/null 2>&1 || PY=python
+          "$PY" - <<'EOF'
+          import glob, zipfile
+          files = glob.glob('dist/*.zip')
+          assert files, 'no zip found in dist/'
+          for f in files:
+              z = zipfile.ZipFile(f)
+              bad = z.testzip()
+              assert bad is None, f'{f}: corrupt entry {bad}'
+              assert z.namelist(), f'{f}: empty archive'
+              print('OK', f, z.namelist())
+          EOF
       - uses: actions/upload-artifact@v4
         with:
           name: win-x64
@@ -61,6 +76,20 @@ jobs:
           if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then TAG="${INPUT_TAG:?}"; else TAG="$GITHUB_REF_NAME"; fi
           mkdir -p dist
           tar -a -cf "dist/NetWorkClipboard-$TAG-macos-${{ matrix.arch }}.zip" -C "target/${{ matrix.target }}/release" nwc-mac
+      - name: 校验 zip 格式
+        shell: bash
+        run: |
+          python3 - <<'EOF'
+          import glob, zipfile
+          files = glob.glob('dist/*.zip')
+          assert files, 'no zip found in dist/'
+          for f in files:
+              z = zipfile.ZipFile(f)
+              bad = z.testzip()
+              assert bad is None, f'{f}: corrupt entry {bad}'
+              assert z.namelist(), f'{f}: empty archive'
+              print('OK', f, z.namelist())
+          EOF
       - uses: actions/upload-artifact@v4
         with:
           name: macos-${{ matrix.arch }}
