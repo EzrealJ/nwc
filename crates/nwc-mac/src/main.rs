@@ -61,7 +61,7 @@ fn main() {
 
     let writer: Arc<dyn nwc_core::sync::ClipboardWriter> =
         pb as Arc<dyn nwc_core::sync::ClipboardWriter>;
-    let ifaces: nwc_core::sync::IfaceProvider = Box::new(adapters::list_ifaces);
+    let ifaces: nwc_core::sync::IfaceProvider = Arc::new(adapters::list_ifaces);
 
     let cfg_path = cfg.state_dir.join("config.json");
     let inbox_dir = cfg.inbox_dir.clone();

@@ -84,7 +84,7 @@ fn spawn_node_with(role: &str, target: &str, port: u16, setup: impl FnOnce(&std:
     let writer = Arc::new(RecordingWriter::default());
     let inbox = cfg.inbox_dir.clone();
     setup(&cfg.state_dir);
-    let mut engine = Engine::new(cfg, Arc::clone(&writer) as Arc<dyn ClipboardWriter>, Box::new(Vec::new), cmd_rx, evt_tx);
+    let mut engine = Engine::new(cfg, Arc::clone(&writer) as Arc<dyn ClipboardWriter>, Arc::new(Vec::new), cmd_rx, evt_tx);
     engine.set_cmd_sender(cmd_tx.clone());
     std::thread::spawn(move || {
         engine.run();

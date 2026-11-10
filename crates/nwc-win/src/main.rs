@@ -178,7 +178,7 @@ fn assemble(mut cfg: nwc_core::config::Config) -> (mpsc::Sender<EngineCmd>, mpsc
 
     let writer: Arc<dyn nwc_core::sync::ClipboardWriter> =
         Arc::clone(&clip) as Arc<dyn nwc_core::sync::ClipboardWriter>;
-    let ifaces: nwc_core::sync::IfaceProvider = Box::new(adapters::list_ifaces);
+    let ifaces: nwc_core::sync::IfaceProvider = Arc::new(adapters::list_ifaces);
 
     let mut engine = Engine::new(cfg, writer, ifaces, cmd_rx, evt_tx);
     engine.set_cmd_sender(cmd_tx.clone());

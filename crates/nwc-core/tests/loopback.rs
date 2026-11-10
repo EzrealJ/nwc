@@ -192,7 +192,7 @@ fn engine_shutdown_during_session_exits() {
         let mut engine = Engine::new(
             cfg,
             Arc::new(NoopWriter),
-            Box::new(Vec::new),
+            Arc::new(Vec::new),
             cmd_rx,
             evt_tx,
         );

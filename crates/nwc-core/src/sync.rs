@@ -53,6 +53,8 @@ pub enum EngineCmd {
     ClearInbox,
     /// 配对偏好：node_id=None 表示清除配对；strict=仅与配对设备同步
     SetPeerPref { node_id: Option<String>, strict: Option<bool> },
+    /// 网络环境变化（换网/网卡增删/休眠唤醒）：由监测线程发出，载荷为可读的网卡描述
+    NetworkChanged { added: Vec<String>, removed: Vec<String> },
     Shutdown,
 }
 
@@ -81,7 +83,35 @@ pub trait ClipboardWriter: Send + Sync {
     fn set_files(&self, paths: &[PathBuf]) -> bool;
 }
 
-pub type IfaceProvider = Box<dyn Fn() -> Vec<IfaceInfo> + Send>;
+/// Arc 而非 Box：网络监测线程需要与引擎共享同一枚举器
+pub type IfaceProvider = Arc<dyn Fn() -> Vec<IfaceInfo> + Send + Sync>;
+
+/// 网络监测周期：换网后最迟该间隔发现并主动断开重连（否则要等 15s 心跳超时）
+const NET_WATCH_INTERVAL_MS: u64 = 2000;
+
+/// 网卡快照（非环回 IPv4 的 name|addr|mask 集合），用于网络变化对比
+fn iface_snapshot(list: &[IfaceInfo]) -> HashSet<String> {
+    list.iter()
+        .filter(|i| !i.internal)
+        .map(|i| format!("{}|{}|{}", i.name, i.addr, i.netmask))
+        .collect()
+}
+
+/// 快照键 → 对用户可读的网卡描述（"en0 192.168.1.2"）
+fn pretty_iface(key: &str) -> String {
+    let mut it = key.split('|');
+    let name = it.next().unwrap_or_default();
+    let addr = it.next().unwrap_or_default();
+    format!("{name} {addr}")
+}
+
+/// 快照差异 → (新增, 移除)
+fn diff_snapshot(prev: &HashSet<String>, cur: &HashSet<String>) -> (Vec<String>, Vec<String>) {
+    (
+        cur.difference(prev).map(|k| pretty_iface(k)).collect(),
+        prev.difference(cur).map(|k| pretty_iface(k)).collect(),
+    )
+}
 
 pub struct Engine {
     cfg: Config,
@@ -104,6 +134,10 @@ pub struct Engine {
     /// 配对偏好（state.json）：preferredPeer（node_id，空=未设置）+ peerStrict
     preferred_peer: String,
     strict_peer: bool,
+    /// 断线窗口内暂存的最新剪贴板内容（重连握手成功后补发）
+    pending: Option<ClipEvent>,
+    /// 网络已变化待消费（让扫描循环跳过等待立即重扫）
+    net_dirty: bool,
 }
 
 struct IncomingFile {
@@ -331,6 +365,8 @@ impl Engine {
             history,
             preferred_peer,
             strict_peer,
+            pending: None,
+            net_dirty: false,
         }
     }
 
@@ -378,8 +414,35 @@ impl Engine {
         }
     }
 
+    /// 后台网络变化监测：周期对比本机 IPv4 快照，变化即通知引擎。
+    /// 换网/休眠唤醒后旧 TCP 连接常呈半开状态（收不到 RST），单靠心跳超时要等 15s。
+    fn spawn_net_watcher(&self) {
+        let ifaces = Arc::clone(&self.ifaces);
+        let stop = Arc::clone(&self.stop);
+        let tx = self.tx_cmd.clone();
+        std::thread::spawn(move || {
+            let mut last = iface_snapshot(&ifaces());
+            while !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(NET_WATCH_INTERVAL_MS));
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                let cur = iface_snapshot(&ifaces());
+                if cur == last {
+                    continue;
+                }
+                let (added, removed) = diff_snapshot(&last, &cur);
+                last = cur;
+                if tx.send(EngineCmd::NetworkChanged { added, removed }).is_err() {
+                    return; // 引擎侧通道已关（进程退出中）
+                }
+            }
+        });
+    }
+
     /// 引擎主入口：supervise（对应 Node 版 supervise/main）
     pub fn run(&mut self) {
+        self.spawn_net_watcher();
         self.log("NetWorkClipboard 启动（原生版）");
         self.log(format!(
             "设备: {}   角色: {}   端口: {}   平台: {}",
@@ -414,7 +477,7 @@ impl Engine {
             peer_hint: &self.cfg.peer_hint,
             ifaces: &self.cfg.ifaces,
             scan_cidr: &self.cfg.scan_cidr,
-            iface_list: &(self.ifaces)(),
+            iface_list: &(&*self.ifaces)(),
         });
         for line in discovery::format_scan_plan(&plan, self.cfg.port, &self.cfg.peer_hint, !self.cfg.scan_cidr.is_empty()) {
             self.log(line);
@@ -493,7 +556,7 @@ impl Engine {
             peer_hint: &self.cfg.peer_hint,
             ifaces: &self.cfg.ifaces,
             scan_cidr: &self.cfg.scan_cidr,
-            iface_list: &(self.ifaces)(),
+            iface_list: &(&*self.ifaces)(),
         });
         if plan.hosts.is_empty() {
             return None;
@@ -528,9 +591,16 @@ impl Engine {
                 if escalate && misses >= 5 {
                     return ClientOutcome::Escalate;
                 }
-                if matches!(self.pump(Duration::from_millis(self.cfg.scan_interval_ms)), PumpResult::Shutdown) {
-                    return ClientOutcome::Shutdown;
+                // 分片等待：网络变化（net_dirty）时提前结束本轮，立即重扫
+                let mut waited = Duration::ZERO;
+                let step = Duration::from_millis(200);
+                while waited < Duration::from_millis(self.cfg.scan_interval_ms) && !self.net_dirty {
+                    if matches!(self.pump(step), PumpResult::Shutdown) {
+                        return ClientOutcome::Shutdown;
+                    }
+                    waited += step;
                 }
+                self.net_dirty = false;
                 continue;
             };
             misses = 0;
@@ -577,6 +647,19 @@ impl Engine {
     /// strict 配对校验：未设置配对或非 strict 时恒通过
     fn peer_rejected(&self, node_id: &str) -> bool {
         !self.preferred_peer.is_empty() && self.strict_peer && node_id != self.preferred_peer
+    }
+
+    /// 网络环境变化：旧连接大概率半开，主动断开进入重扫；
+    /// peer_hint 指向的旧网段 IP 不再优先尝试（重连成功后会重新写入）
+    fn on_network_changed(&mut self, added: Vec<String>, removed: Vec<String>) {
+        let fmt = |v: &[String]| if v.is_empty() { "无".into() } else { v.join("、") };
+        self.log(format!("网络环境变化：新增 {}，移除 {}", fmt(&added), fmt(&removed)));
+        self.cfg.peer_hint.clear();
+        self.net_dirty = true;
+        if let Some(conn) = self.conn.take() {
+            self.log("已断开当前连接（网络已变化），重新扫描对端…");
+            conn.close(); // 读线程会上抛 PeerClosed，当前 session 随之结束
+        }
     }
 
     fn tx_up(&self) -> Sender<EngineCmd> {
@@ -670,6 +753,11 @@ impl Engine {
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(_) => {}
             }
+            // 网络变化时跳过等待，立即触发下一轮后台扫描
+            if self.net_dirty {
+                self.net_dirty = false;
+                next_scan = Instant::now();
+            }
             // 后台扫描：发现别的监听端则降级为客户端连过去
             if !demoted && self.conn.is_none() && Instant::now() >= next_scan {
                 next_scan = Instant::now() + Duration::from_millis(self.cfg.scan_interval_ms);
@@ -711,8 +799,9 @@ impl Engine {
         if !self.paused {
             self.status(Status::Connected(self.last_peer_label.clone()));
         }
-        self.conn = Some(peer);
+        self.conn = Some(Arc::clone(&peer));
         self.conn_closed = false;
+        self.flush_pending(&peer);
         while !self.conn_closed {
             if matches!(self.pump(Duration::from_millis(200)), PumpResult::Shutdown) {
                 self.stop.store(true, Ordering::SeqCst);
@@ -725,6 +814,14 @@ impl Engine {
         }
         self.conn = None;
         self.flush_all_batches();
+    }
+
+    /// 断线窗口暂存的剪贴板内容，重连握手成功后补发（只保留最新一条，
+    /// 剪贴板本就是"最新语义"；EchoGuard 的 remember 在真正发送时才执行，天然防重）
+    fn flush_pending(&mut self, conn: &Arc<PeerConnection>) {
+        let Some(ev) = self.pending.take() else { return };
+        self.log("补发断线期间暂存的剪贴板内容");
+        self.send_clip(conn, ev);
     }
 
     fn handle_cmd(&mut self, cmd: EngineCmd) -> bool {
@@ -792,6 +889,7 @@ impl Engine {
                 self.log(format!("连接已断开（{reason}）"));
                 self.conn_closed = true;
             }
+            EngineCmd::NetworkChanged { added, removed } => self.on_network_changed(added, removed),
         }
         true
     }
@@ -804,13 +902,28 @@ impl Engine {
         if let ClipEvent::Text(s) = &ev {
             self.record_text(s, false);
         }
-        let Some(conn) = self.conn.clone() else { return };
+        let Some(conn) = self.conn.clone() else {
+            self.stash_pending(ev);
+            return;
+        };
         if conn.is_closed() {
+            self.stash_pending(ev);
             return;
         }
+        self.send_clip(&conn, ev);
+    }
+
+    /// 断线窗口（换网重连/对端暂离）：暂存最新一条剪贴板内容，重连后补发。
+    /// 旧值直接被覆盖——剪贴板是"最新语义"，补发旧内容反而制造混乱。
+    fn stash_pending(&mut self, ev: ClipEvent) {
+        self.pending = Some(ev);
+    }
+
+    /// 剪贴板事件上行（on_clip 与断线补发共用路径）
+    fn send_clip(&mut self, conn: &Arc<PeerConnection>, ev: ClipEvent) {
         match ev {
-            ClipEvent::Text(s) => self.send_text(&conn, &s),
-            ClipEvent::Image(png) => self.send_image(&conn, &png),
+            ClipEvent::Text(s) => self.send_text(conn, &s),
+            ClipEvent::Image(png) => self.send_image(conn, &png),
             ClipEvent::Files(mut paths) => {
                 // 去重保序 + 排除收件箱内路径（收件箱只收不发）
                 let mut seen = HashSet::new();
@@ -825,7 +938,7 @@ impl Engine {
                     true
                 });
                 if !paths.is_empty() {
-                    self.send_files(&conn, &paths);
+                    self.send_files(conn, &paths);
                 }
             }
         }
@@ -1849,6 +1962,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn iface_snapshot_diff() {
+        let snap = |spec: &[(&str, &str, bool)]| {
+            iface_snapshot(
+                &spec
+                    .iter()
+                    .map(|(n, a, internal)| IfaceInfo {
+                        name: n.to_string(),
+                        addr: a.parse().unwrap(),
+                        netmask: "255.255.255.0".parse().unwrap(),
+                        internal: *internal,
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        };
+        // 换网：同网卡换 IP → 一增一移除；环回（internal）不参与快照
+        let home = snap(&[("en0", "192.168.1.2", false), ("lo0", "127.0.0.1", true)]);
+        let office = snap(&[("en0", "192.168.31.2", false)]);
+        let (added, removed) = diff_snapshot(&home, &office);
+        assert_eq!(added, vec!["en0 192.168.31.2"]);
+        assert_eq!(removed, vec!["en0 192.168.1.2"]);
+        // 网卡增删（插网线）：只有一侧有变化
+        let (added, removed) = diff_snapshot(&office, &snap(&[("en0", "192.168.31.2", false), ("en5", "10.0.0.5", false)]));
+        assert_eq!(added, vec!["en5 10.0.0.5"]);
+        assert!(removed.is_empty());
+    }
+
+    /// 网络变化 → 清 peer_hint/置 net_dirty；断线窗口复制 → 暂存待补发
+    #[test]
+    fn network_change_and_pending_stash() {
+        let mut cfg = crate::config::Config::default();
+        cfg.state_dir = std::env::temp_dir().join(format!("nwc-netchg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cfg.state_dir);
+        cfg.peer_hint = "192.168.1.99".into();
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (evt_tx, _evt) = std::sync::mpsc::channel();
+        let mut e = Engine::new(cfg, Arc::new(NoopW), Arc::new(Vec::new), cmd_rx, evt_tx);
+        e.set_cmd_sender(cmd_tx);
+
+        // 断线期间复制 → 暂存最新一条（旧的被覆盖）
+        e.on_clip(ClipEvent::Text("第一次复制".into()));
+        e.on_clip(ClipEvent::Text("换网期间复制的文本".into()));
+        assert!(matches!(&e.pending, Some(ClipEvent::Text(s)) if s == "换网期间复制的文本"));
+
+        // 网络变化 → hint 清空、net_dirty 置位（无连接时 take 无害）
+        e.on_network_changed(vec!["en0 192.168.31.2".into()], vec!["en0 192.168.1.2".into()]);
+        assert!(e.cfg.peer_hint.is_empty());
+        assert!(e.net_dirty);
+        let _ = std::fs::remove_dir_all(&e.cfg.state_dir);
+    }
+
+    #[test]
     fn safe_names() {
         assert_eq!(safe_name("normal.txt"), "normal.txt");
         assert_eq!(safe_name("trail... "), "trail");
@@ -1899,7 +2063,7 @@ mod tests {
 
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         let (evt_tx, _evt) = std::sync::mpsc::channel();
-        let mut e = Engine::new(cfg, Arc::new(NoopW), Box::new(Vec::new), cmd_rx, evt_tx);
+        let mut e = Engine::new(cfg, Arc::new(NoopW), Arc::new(Vec::new), cmd_rx, evt_tx);
         e.set_cmd_sender(cmd_tx);
 
         let send = |e: &mut Engine, rel: &str, payload: &[u8], batch: &str| {
