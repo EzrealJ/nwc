@@ -63,13 +63,37 @@ define_class! {
         /// 历史条目点击：普通点击 = 重新粘贴并同步对端；按住 Option 点击 = 删除该条
         #[unsafe(method(pasteHistory:))]
         unsafe fn paste_history(&self, sender: *mut AnyObject) {
-            let Some(text) = represented_text(sender) else { return };
+            let Some(key) = represented_text(sender) else { return };
             // +[NSEvent modifierFlags]：此刻的全局修饰键状态（类方法，objc2 生成代码只暴露了实例版）
             let flags: NSEventModifierFlags = msg_send![NSEvent::class(), modifierFlags];
             if flags.contains(NSEventModifierFlags::Option) {
-                let _ = self.ivars().cmd_tx.send(EngineCmd::RemoveHistory(text));
+                let _ = self.ivars().cmd_tx.send(EngineCmd::RemoveHistory(key));
             } else {
-                let _ = self.ivars().cmd_tx.send(EngineCmd::PasteText(text));
+                let _ = self.ivars().cmd_tx.send(EngineCmd::PasteText(key));
+            }
+        }
+
+        /// 历史图片条目点击：普通点击 = 重新复制图片并同步对端；Option 点击 = 删除
+        #[unsafe(method(pasteHistoryImage:))]
+        unsafe fn paste_history_image(&self, sender: *mut AnyObject) {
+            let Some(path) = represented_text(sender) else { return };
+            let flags: NSEventModifierFlags = msg_send![NSEvent::class(), modifierFlags];
+            if flags.contains(NSEventModifierFlags::Option) {
+                let _ = self.ivars().cmd_tx.send(EngineCmd::RemoveHistory(path));
+            } else {
+                let _ = self.ivars().cmd_tx.send(EngineCmd::PasteImage(path));
+            }
+        }
+
+        /// 历史文件条目点击：普通点击 = 在 Finder 中显示；Option 点击 = 删除
+        #[unsafe(method(revealHistoryFile:))]
+        unsafe fn reveal_history_file(&self, sender: *mut AnyObject) {
+            let Some(path) = represented_text(sender) else { return };
+            let flags: NSEventModifierFlags = msg_send![NSEvent::class(), modifierFlags];
+            if flags.contains(NSEventModifierFlags::Option) {
+                let _ = self.ivars().cmd_tx.send(EngineCmd::RemoveHistory(path));
+            } else {
+                let _ = std::process::Command::new("open").arg("-R").arg(&path).spawn();
             }
         }
 
@@ -296,15 +320,21 @@ unsafe fn append_history_submenu(menu: &NSMenu, ctrl: &NwcMenuController, mtm: M
         for e in &entries {
             let one_line: String = e.text.chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
             let title: String = one_line.chars().take(60).collect();
+            // 类型分发：文本=重新粘贴；图片=重新复制（PasteImage）；文件=Finder 显示
+            let (kind_prefix, action, represented): (&str, &'static std::ffi::CStr, String) = match e.kind {
+                nwc_core::history::EntryKind::Text => ("", c"pasteHistory:", e.text.clone()),
+                nwc_core::history::EntryKind::Image => ("[图] ", c"pasteHistoryImage:", e.data.clone().unwrap_or_else(|| e.text.clone())),
+                nwc_core::history::EntryKind::File => ("[档] ", c"revealHistoryFile:", e.data.clone().unwrap_or_else(|| e.text.clone())),
+            };
             let it = NSMenuItem::new(mtm);
             it.setTitle(&NSString::from_str(&format!(
-                "{}{}",
+                "{kind_prefix}{}{}",
                 if e.peer { "⇄ " } else { "" },
                 if one_line.chars().count() > 60 { format!("{title}…") } else { title }
             )));
-            it.setAction(Some(Sel::register(c"pasteHistory:")));
+            it.setAction(Some(Sel::register(action)));
             it.setTarget(Some(as_any(ctrl)));
-            it.setRepresentedObject(Some(&NSString::from_str(&e.text)));
+            it.setRepresentedObject(Some(&NSString::from_str(&represented)));
             sub.addItem(&it);
         }
         sub.addItem(&separator(mtm));

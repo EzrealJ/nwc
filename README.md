@@ -23,7 +23,7 @@ Windows 端单个 ~2MB exe、私有内存 ~2MB；macOS 端单进程、剪贴板�
 - **已知对端与配对**：每次成功握手自动登记设备（`peers.json`）；菜单「已知对端」可选择配对设备——默认优先连接它（IP 漂移按设备 ID 识别），开启「仅与配对设备同步」后非配对设备一律拒绝（多台设备共用口令时防止剪贴板流向错误机器）
 - 大文件 256KB 分块流式传输（能力自动协商，内存占用恒定）
 - 剪贴板图片双向同步：Windows 端 PNG + CF_DIBV5 双格式写入、DIB（24/32bpp）自动转码；macOS 端 TIFF + PNG + PNGf 三格式写入，各类粘贴目标都能识别
-- 文字剪贴板历史（默认 20 条，重启保留；Windows 双击条目 / macOS 菜单栏「历史记录」点击条目即可重新复制并同步对端）
+- 剪贴板历史（默认 20 条，重启保留）：**文本 / 图片 / 文件三种类型**统一记录（图片以 PNG 落盘 `~/.networkclipboard/history/`，超过 5MB 不进历史；文件记录收件箱路径），条目带类型标识，支持搜索；Windows 窗口双击条目 / macOS 菜单栏点击条目即可重新复制并同步对端（文件条目则打开所在位置）
 - 收到文件时托盘气泡 / 系统通知提示；收件箱自动按天清理（中转缓存语义，默认保留 14 天）
 - 单实例保护（Windows 命名互斥量 / macOS flock），双开自动拦截
 - 自动过滤 198.18.0.0/15（Clash/Mihomo 等 fake-IP TUN 网段，避免误判对端）
@@ -51,7 +51,7 @@ nwc --help         # 全部参数
 - 配置文件：`~/.networkclipboard/config.json`——两端均有「设置…」对话框（口令/端口/设备名/角色/收件箱目录/历史开关与条数/收件箱保留天数/同名文件覆盖；**合并写**，保留手写的其它键），保存后自动重启生效；「编辑配置文件…」留作高级用途
 - 收件箱默认 `~/NetWorkClipboard/inbox`——**它是文件中转缓存而非归档存储**：同名文件一律覆盖原名（latest-wins，文件名保持稳定；内容相同则幂等跳过）；若希望同名不同内容时保留副本，设置里取消「同名文件直接覆盖」（或 config.json 写 `inboxRenameOnConflict: true`，恢复 `名字 (N).ext` 后缀避让）。自动按保留天数清理（默认 14 天，`inboxKeepDays` 配置，`0` 关闭；启动与每批次接收后触发），也可在菜单「清空收件箱…」手动清理；日志在 `~/.networkclipboard/logs/`（按天滚动、保留 7 天，两端 GUI 模式均落盘）
 - 托盘/菜单栏菜单：暂停/恢复同步、历史记录、打开收件箱、打开日志、设置/编辑配置、开机自启（Windows 写 HKCU 注册表无 UAC；macOS 用 LaunchAgent）、退出
-- 历史记录：Windows 是独立窗口（双击粘贴、可删单条）；macOS 在菜单栏子菜单里（点击粘贴、**按住 Option 点击删除该条**）。默认保留 20 条（`~/.networkclipboard/history.json`），可在 config.json 用 `historyEnabled` / `historyLimit` 调整
+- 历史记录：Windows 是独立窗口（顶部搜索框实时过滤、双击粘贴、可删单条）；macOS 在菜单栏子菜单里（点击粘贴、**按住 Option 点击删除该条**）。默认保留 20 条（`~/.networkclipboard/history.json`），可在 config.json 用 `historyEnabled` / `historyLimit` 调整
 - macOS 菜单栏为 SF Symbol 状态图标（连接/扫描/暂停等），悬停显示状态文字
 - 排查问题：两端看 `~/.networkclipboard/logs/` 当天日志；图片/文件没同步时，日志会记录剪贴板实际格式列表与转码失败原因
 

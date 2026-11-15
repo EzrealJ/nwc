@@ -17,13 +17,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
     GetSystemMetrics, LB_GETCURSEL, LB_GETCOUNT, LB_RESETCONTENT, LB_ADDSTRING, LB_SETCURSEL,
     PostQuitMessage, RegisterClassW, SendMessageW, SetForegroundWindow, ShowWindow, TranslateMessage,
-    CW_USEDEFAULT, HMENU, LBN_DBLCLK, LBN_SELCHANGE, MSG, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW,
+    CW_USEDEFAULT, EN_CHANGE, HMENU, LBN_DBLCLK, LBN_SELCHANGE, MSG, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW,
     WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_SETFONT, WNDCLASSW,
-    WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 
-use nwc_core::history::{load, HistoryEntry};
+use nwc_core::history::{load, EntryKind, HistoryEntry};
 use nwc_core::sync::EngineCmd;
 
 const CW: i32 = 520;
@@ -35,6 +35,7 @@ const IDC_PASTE: i32 = 1302;
 const IDC_DELETE: i32 = 1303;
 const IDC_CLEAR: i32 = 1304;
 const IDC_CLOSE: i32 = 1305;
+const IDC_SEARCH: i32 = 1306;
 
 static GUI_FONT: LazyLock<HFONT> = LazyLock::new(|| unsafe {
     HFONT(GetStockObject(DEFAULT_GUI_FONT).0 as isize)
@@ -47,7 +48,10 @@ thread_local! {
 struct Ctx {
     cmd_tx: Sender<EngineCmd>,
     state_dir: PathBuf,
+    /// 全量条目（与磁盘一致）
     entries: Vec<HistoryEntry>,
+    /// 当前搜索过滤后的视图（列表与选中操作都基于它）
+    view: Vec<HistoryEntry>,
 }
 
 /// 打开历史记录窗口（消息循环在托盘线程上跑；引擎线程不受影响）
@@ -57,6 +61,7 @@ pub fn open_history(cmd_tx: Sender<EngineCmd>, state_dir: PathBuf) {
             cmd_tx,
             state_dir,
             entries: Vec::new(),
+            view: Vec::new(),
         })
     });
     unsafe {
@@ -127,9 +132,11 @@ unsafe extern "system" fn hist_wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             let id = (wp.0 & 0xFFFF) as i32;
             let notify = ((wp.0 >> 16) & 0xFFFF) as u32;
             if id == IDC_LIST && notify == LBN_DBLCLK as u32 {
-                paste_selected(hwnd);
+                activate_selected(hwnd);
             } else if id == IDC_LIST && notify == LBN_SELCHANGE as u32 {
                 update_button_state(hwnd);
+            } else if id == IDC_SEARCH && notify == EN_CHANGE as u32 {
+                reload_list(hwnd);
             } else if id == IDC_PASTE {
                 paste_selected(hwnd);
             } else if id == IDC_DELETE {
@@ -179,12 +186,16 @@ unsafe fn ctl(parent: HWND, class: PCWSTR, text: &str, style: WINDOW_STYLE, ex: 
 
 fn create_controls(hwnd: HWND) {
     unsafe {
-        let _ = ctl(hwnd, w!("STATIC"), "双击或点「重新复制」把选中项放回剪贴板（并同步到对端）",
+        let _ = ctl(hwnd, w!("STATIC"), "文本/图片双击重新复制（并同步对端）；文件双击打开所在位置",
             WS_CHILD | WS_VISIBLE, WINDOW_EX_STYLE(0), PAD, 10, CW - PAD * 2, 18, 0);
+        // 搜索框（EN_CHANGE 实时过滤）
+        let _ = ctl(hwnd, w!("EDIT"), "",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER,
+            WINDOW_EX_STYLE(0x200), PAD, 32, CW - PAD * 2, 24, IDC_SEARCH);
         // 列表（LBS_NOTIFY=0x1 | LBS_NOINTEGRALHEIGHT=0x100）
         let _ = ctl(hwnd, w!("LISTBOX"), "",
             WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_TABSTOP | WINDOW_STYLE(0x0001 | 0x0100),
-            WINDOW_EX_STYLE(0x200), PAD, 32, CW - PAD * 2, CH - 32 - 54, IDC_LIST);
+            WINDOW_EX_STYLE(0x200), PAD, 64, CW - PAD * 2, CH - 64 - 54, IDC_LIST);
         // 按钮行
         let by = CH - 46;
         let _ = ctl(hwnd, w!("BUTTON"), "重新复制", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
@@ -198,17 +209,30 @@ fn create_controls(hwnd: HWND) {
     }
 }
 
-/// 从磁盘重载条目并重建列表（每次操作后调用，保持与引擎落盘一致）
+/// 从磁盘重载条目并按搜索词过滤后重建列表（每次操作后调用，保持与引擎落盘一致）
 fn reload_list(hwnd: HWND) {
     CTX.with(|c| {
         let mut ctx = c.borrow_mut();
         let Some(ctx) = ctx.as_mut() else { return };
         ctx.entries = load(&ctx.state_dir);
+        let query = unsafe { get_text(hwnd, IDC_SEARCH) }.to_lowercase();
+        ctx.view = ctx
+            .entries
+            .iter()
+            .filter(|e| query.is_empty() || e.text.to_lowercase().contains(&query))
+            .cloned()
+            .collect();
         unsafe {
             let list = get_ctl(hwnd, IDC_LIST);
             let _ = SendMessageW(list, LB_RESETCONTENT, WPARAM(0), LPARAM(0));
-            for e in &ctx.entries {
-                let line = format!("{}  {}  {}", fmt_time(e.at), if e.peer { "对端" } else { "本机" }, preview(&e.text));
+            for e in &ctx.view {
+                let line = format!(
+                    "[{}]  {}  {}  {}",
+                    kind_tag(e.kind),
+                    fmt_time(e.at),
+                    if e.peer { "对端" } else { "本机" },
+                    preview(&e.text)
+                );
                 let wide: Vec<u16> = line.encode_utf16().chain(std::iter::once(0)).collect();
                 let _ = SendMessageW(list, LB_ADDSTRING, WPARAM(0), LPARAM(wide.as_ptr() as isize));
             }
@@ -216,6 +240,15 @@ fn reload_list(hwnd: HWND) {
         }
     });
     update_button_state(hwnd);
+}
+
+/// 类型标签：文 / 图 / 档
+fn kind_tag(k: EntryKind) -> &'static str {
+    match k {
+        EntryKind::Text => "文",
+        EntryKind::Image => "图",
+        EntryKind::File => "档",
+    }
 }
 
 fn update_button_state(hwnd: HWND) {
@@ -230,7 +263,7 @@ fn update_button_state(hwnd: HWND) {
     }
 }
 
-fn selected_text(hwnd: HWND) -> Option<String> {
+fn selected_entry(hwnd: HWND) -> Option<HistoryEntry> {
     CTX.with(|c| {
         let ctx = c.borrow();
         let ctx = ctx.as_ref()?;
@@ -238,25 +271,57 @@ fn selected_text(hwnd: HWND) -> Option<String> {
         if sel < 0 {
             return None;
         }
-        ctx.entries.get(sel as usize).map(|e| e.text.clone())
+        ctx.view.get(sel as usize).cloned()
     })
 }
 
-fn paste_selected(hwnd: HWND) {
-    let Some(text) = selected_text(hwnd) else { return };
-    CTX.with(|c| {
-        if let Some(ctx) = c.borrow().as_ref() {
-            let _ = ctx.cmd_tx.send(EngineCmd::PasteText(text));
+/// 双击 / 重新复制：文本与图片放回剪贴板（并同步对端），文件打开所在位置
+fn activate_selected(hwnd: HWND) {
+    let Some(e) = selected_entry(hwnd) else { return };
+    match e.kind {
+        EntryKind::Text => {
+            CTX.with(|c| {
+                if let Some(ctx) = c.borrow().as_ref() {
+                    let _ = ctx.cmd_tx.send(EngineCmd::PasteText(e.text));
+                }
+            });
+            reload_list(hwnd); // 粘贴会把该条置顶
         }
-    });
-    reload_list(hwnd); // 粘贴会把该条置顶
+        EntryKind::Image => {
+            if let Some(path) = e.data {
+                CTX.with(|c| {
+                    if let Some(ctx) = c.borrow().as_ref() {
+                        let _ = ctx.cmd_tx.send(EngineCmd::PasteImage(path));
+                    }
+                });
+                reload_list(hwnd);
+            }
+        }
+        EntryKind::File => {
+            if let Some(path) = e.data {
+                reveal_in_explorer(&path);
+            }
+        }
+    }
+}
+
+/// 在资源管理器中定位文件（/select 与路径间不加空格）
+fn reveal_in_explorer(path: &str) {
+    let _ = std::process::Command::new("explorer")
+        .arg(format!("/select,{path}"))
+        .spawn();
+}
+
+fn paste_selected(hwnd: HWND) {
+    activate_selected(hwnd);
 }
 
 fn delete_selected(hwnd: HWND) {
-    let Some(text) = selected_text(hwnd) else { return };
+    let Some(e) = selected_entry(hwnd) else { return };
+    let key = e.key().to_string();
     CTX.with(|c| {
         if let Some(ctx) = c.borrow().as_ref() {
-            let _ = ctx.cmd_tx.send(EngineCmd::RemoveHistory(text));
+            let _ = ctx.cmd_tx.send(EngineCmd::RemoveHistory(key));
         }
     });
     reload_list(hwnd);
@@ -273,6 +338,14 @@ fn clear_all(hwnd: HWND) {
 
 fn get_ctl(hwnd: HWND, id: i32) -> HWND {
     unsafe { windows::Win32::UI::WindowsAndMessaging::GetDlgItem(hwnd, id) }
+}
+
+unsafe fn get_text(hwnd: HWND, id: i32) -> String {
+    let ctl = get_ctl(hwnd, id);
+    let len = windows::Win32::UI::WindowsAndMessaging::GetWindowTextLengthW(ctl);
+    let mut buf = vec![0u16; (len + 1) as usize];
+    let n = windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(ctl, &mut buf);
+    String::from_utf16_lossy(&buf[..n.max(0) as usize])
 }
 
 /// 预览：压缩空白、单行、限长

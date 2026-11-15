@@ -45,6 +45,8 @@ pub enum EngineCmd {
     Resume,
     /// 从历史记录重新粘贴：写本地剪贴板并同步到对端
     PasteText(String),
+    /// 从历史记录重新粘贴图片（参数为 PNG 落盘路径）
+    PasteImage(String),
     /// 删除单条历史（按文本匹配；列表内已去重，文本即唯一键）
     RemoveHistory(String),
     /// 清空历史
@@ -844,6 +846,7 @@ impl Engine {
                 self.status(if self.conn.is_some() { Status::Connected(String::new()) } else { Status::Scanning });
             }
             EngineCmd::PasteText(text) => self.paste_text(text),
+            EngineCmd::PasteImage(path) => self.paste_image(path),
             EngineCmd::RemoveHistory(text) => {
                 if crate::history::remove(&mut self.history, &text) {
                     crate::history::save(&self.cfg.state_dir, &self.history);
@@ -902,9 +905,18 @@ impl Engine {
 
     fn on_clip(&mut self, ev: ClipEvent) {
         // 历史与连接无关：断线时的本机复制也留痕（远端写入已被平台层序列号/令牌吸收，
-        // 到达这里的都是真实复制；回声命中不记录由 record_text 的去重置顶兜住）
-        if let ClipEvent::Text(s) = &ev {
-            self.record_text(s, false);
+        // 到达这里的都是真实复制；回声命中不记录由去重置顶兜住）
+        match &ev {
+            ClipEvent::Text(s) => self.record_text(s, false),
+            ClipEvent::Image(png) => self.record_image(png, false),
+            ClipEvent::Files(paths) => {
+                // 收件箱只收不发，也不进本机复制历史（对端接收时已另行记录）
+                for p in paths {
+                    if !is_inside_inbox(p, &self.cfg.inbox_dir) {
+                        self.record_file_path(p, false);
+                    }
+                }
+            }
         }
         let Some(conn) = self.conn.clone() else {
             self.stash_pending(ev);
@@ -1386,6 +1398,56 @@ impl Engine {
         }
     }
 
+    /// 图片历史：PNG 落盘 state/history/（内容寻址去重），条目存路径 + 尺寸摘要
+    fn record_image(&mut self, png: &[u8], peer: bool) {
+        if !self.cfg.history_enabled {
+            return;
+        }
+        let dir = self.cfg.state_dir.join("history");
+        if crate::history::push_image(&mut self.history, &dir, png, peer, self.cfg.history_limit as usize) {
+            crate::history::save(&self.cfg.state_dir, &self.history);
+        }
+    }
+
+    /// 文件/文件夹历史：条目存路径 + 大小摘要
+    fn record_file_path(&mut self, path: &Path, peer: bool) {
+        if !self.cfg.history_enabled {
+            return;
+        }
+        if crate::history::push_file(&mut self.history, path, peer, self.cfg.history_limit as usize) {
+            crate::history::save(&self.cfg.state_dir, &self.history);
+        }
+    }
+
+    /// 从历史记录重新粘贴图片：写本地剪贴板 + 同步对端（回声双向抑制）
+    fn paste_image(&mut self, path: String) {
+        let Ok(png) = std::fs::read(&path) else {
+            self.warn("历史图片文件已不存在");
+            return;
+        };
+        if !crate::history::image_entry_allowed(&png) {
+            self.warn("历史图片不可用（格式无效或超出历史体积上限）");
+            return;
+        }
+        self.echo.remember(&sha256_hex(&png));
+        if let Some(conn) = self.conn.clone() {
+            if !conn.is_closed()
+                && conn.send_bin(
+                    &protocol::HdrImage { t: "image", mime: "image/png", size: png.len() },
+                    &png,
+                )
+            {
+                self.log(format!("↑ 已从历史记录同步图片到对端（{}）", fmt_bytes(png.len() as u64)));
+            }
+        }
+        if self.writer.set_image(&png) {
+            self.record_image(&png, false); // 置顶
+            self.log(format!("✓ 已从历史记录粘贴图片（{}）", fmt_bytes(png.len() as u64)));
+        } else {
+            self.warn("写入剪贴板失败（图片）");
+        }
+    }
+
     /// 从历史记录重新粘贴：写本地剪贴板 + 同步对端（等同一次接收动作，双向回声均已抑制）
     fn paste_text(&mut self, text: String) {
         self.echo.remember(&hash_text(&text));
@@ -1416,6 +1478,7 @@ impl Engine {
                 }
                 self.echo.remember(&sha256_hex(&payload));
                 if self.writer.set_image(&payload) {
+                    self.record_image(&payload, true);
                     self.log(format!("↓ 已接收图片（{}）", fmt_bytes(payload.len() as u64)));
                 } else {
                     self.warn("写入本地剪贴板失败（图片）");
@@ -1805,6 +1868,12 @@ impl Engine {
         let incomplete = b.count > 0 && b.got < b.count;
         b.idle_at = Instant::now() + Duration::from_secs(3600);
         self.flush_batch(&mut b, incomplete);
+        // 完整批次：顶层条目（单文件/文件夹根）进文件历史
+        if !incomplete && !b.aborted && !b.items.is_empty() {
+            for item in &b.items {
+                self.record_file_path(item, true);
+            }
+        }
         // 批次落定后顺手做一次按天数的收件箱清理（刚收到的文件 mtime 是新的，不会误删）
         self.maybe_prune_inbox(false);
     }
@@ -2051,6 +2120,31 @@ mod tests {
         fn set_files(&self, _p: &[PathBuf]) -> bool { true }
     }
 
+    /// 捕获写剪贴板调用的测试替身（观察 set_image/set_files 是否被引擎触发）
+    struct CaptureW(std::sync::Mutex<(Vec<Vec<u8>>, Vec<Vec<PathBuf>>)>);
+    impl ClipboardWriter for CaptureW {
+        fn set_text(&self, _s: &str) -> bool { true }
+        fn set_image(&self, png: &[u8]) -> bool {
+            self.0.lock().unwrap().0.push(png.to_vec());
+            true
+        }
+        fn set_files(&self, paths: &[PathBuf]) -> bool {
+            self.0.lock().unwrap().1.push(paths.to_vec());
+            true
+        }
+    }
+
+    /// 1×1 合法 PNG（历史图片测试通用夹具）
+    fn test_png() -> Vec<u8> {
+        vec![
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08,
+            0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xDD, 0x8D,
+            0xB0, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ]
+    }
+
     fn inbox_entries(dir: &Path) -> Vec<String> {
         let mut v: Vec<String> = std::fs::read_dir(dir)
             .map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
@@ -2173,5 +2267,111 @@ mod tests {
         let inbox = Path::new("C:/Users/x/NetWorkClipboard/inbox");
         assert!(is_inside_inbox(Path::new("C:/Users/x/NetWorkClipboard/inbox/a.txt"), inbox));
         assert!(!is_inside_inbox(Path::new("C:/Users/x/NetWorkClipboard/out/a.txt"), inbox));
+    }
+
+    /// 接收图片 → 进历史（Image 条目 + PNG 落盘 state/history/）
+    #[test]
+    fn incoming_image_lands_in_history() {
+        use std::sync::Arc;
+        let dir = std::env::temp_dir().join(format!("nwc-img-hist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut cfg = crate::config::Config::default();
+        cfg.state_dir = dir.join("state");
+        cfg.inbox_dir = dir.join("inbox");
+        cfg.inbox_keep_days = 0;
+
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (evt_tx, _evt) = std::sync::mpsc::channel();
+        let mut e = Engine::new(cfg, Arc::new(NoopW), Arc::new(Vec::new), cmd_rx, evt_tx);
+        e.set_cmd_sender(cmd_tx);
+
+        let png = test_png();
+        let hdr = serde_json::json!({"t": "image", "size": png.len()});
+        e.handle_cmd(EngineCmd::PeerBin(hdr, png.clone()));
+
+        assert_eq!(e.history.len(), 1, "接收图片应产生一条历史");
+        assert_eq!(e.history[0].kind, crate::history::EntryKind::Image);
+        assert!(e.history[0].peer, "对端来源应标记 peer");
+        assert!(e.history[0].text.contains("1×1"), "摘要含尺寸: {}", e.history[0].text);
+        let data = e.history[0].data.clone().unwrap();
+        assert!(Path::new(&data).exists(), "PNG 应落盘: {data}");
+        // 同图再收一次：内容寻址去重，仍一条
+        let hdr2 = serde_json::json!({"t": "image", "size": png.len()});
+        e.handle_cmd(EngineCmd::PeerBin(hdr2, png));
+        assert_eq!(e.history.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 接收文件 → 进历史（File 条目，data 为收件箱路径）
+    #[test]
+    fn incoming_file_lands_in_history() {
+        use std::sync::Arc;
+        let dir = std::env::temp_dir().join(format!("nwc-file-hist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut cfg = crate::config::Config::default();
+        cfg.state_dir = dir.join("state");
+        cfg.inbox_dir = dir.join("inbox");
+        cfg.inbox_keep_days = 0;
+
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (evt_tx, _evt) = std::sync::mpsc::channel();
+        let mut e = Engine::new(cfg, Arc::new(NoopW), Arc::new(Vec::new), cmd_rx, evt_tx);
+        e.set_cmd_sender(cmd_tx);
+
+        let hdr = serde_json::json!({
+            "t": "file", "rel": "报告.pdf", "size": 5,
+            "sha256": crate::util::sha256_hex(b"hello"),
+            "index": 1, "count": 1, "ri": 0, "batchId": "b1",
+        });
+        e.handle_cmd(EngineCmd::PeerBin(hdr, b"hello".to_vec()));
+
+        assert_eq!(e.history.len(), 1, "接收文件应产生一条历史");
+        assert_eq!(e.history[0].kind, crate::history::EntryKind::File);
+        assert!(e.history[0].peer);
+        assert!(e.history[0].text.starts_with("文件 报告.pdf · "), "摘要: {}", e.history[0].text);
+        let data = e.history[0].data.clone().unwrap();
+        assert!(Path::new(&data).exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PasteImage：读回 PNG → 写剪贴板（可观察）→ 置顶历史（peer 翻转为本机）
+    #[test]
+    fn paste_image_rewrites_clipboard_and_tops_history() {
+        use std::sync::Arc;
+        let dir = std::env::temp_dir().join(format!("nwc-paste-img-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut cfg = crate::config::Config::default();
+        cfg.state_dir = dir.join("state");
+        cfg.inbox_dir = dir.join("inbox");
+        cfg.inbox_keep_days = 0;
+
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (evt_tx, _evt) = std::sync::mpsc::channel();
+        let w = Arc::new(CaptureW(std::sync::Mutex::new((Vec::new(), Vec::new()))));
+        let mut e = Engine::new(cfg, Arc::clone(&w) as Arc<dyn ClipboardWriter>, Arc::new(Vec::new), cmd_rx, evt_tx);
+        e.set_cmd_sender(cmd_tx);
+
+        // 先接收一张图（peer=true 入历史）
+        let png = test_png();
+        let hdr = serde_json::json!({"t": "image", "size": png.len()});
+        e.handle_cmd(EngineCmd::PeerBin(hdr, png.clone()));
+        assert!(e.history[0].peer);
+
+        // 从历史粘贴：写剪贴板 + 置顶且翻转为本机
+        let path = e.history[0].data.clone().unwrap();
+        e.handle_cmd(EngineCmd::PasteImage(path));
+        assert_eq!(w.0.lock().unwrap().0.len(), 2, "set_image 应被调用（接收 + 粘贴）");
+        assert_eq!(e.history[0].kind, crate::history::EntryKind::Image);
+        assert!(!e.history[0].peer, "粘贴后应翻转为本机来源");
+        assert_eq!(e.history.len(), 1, "同图按键置顶不新增");
+
+        // 路径失效：不 panic、历史不变
+        e.handle_cmd(EngineCmd::PasteImage(dir.join("ghost.png").to_string_lossy().into_owned()));
+        assert_eq!(e.history.len(), 1);
+        assert_eq!(w.0.lock().unwrap().0.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
