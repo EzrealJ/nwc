@@ -201,6 +201,12 @@ fn run_console(cfg: nwc_core::config::Config) -> i32 {
             EngineEvent::Warn(m) => println!("[{ts}] [警告] {m}"),
             EngineEvent::Status(s) => println!("[{ts}] [状态] {}", status_label(&s)),
             EngineEvent::Notify(t, b) => println!("[{ts}] [通知] {t}: {b}"),
+            EngineEvent::Progress(p) => {
+                let arrow = if p.up { "↑ 发送" } else { "↓ 接收" };
+                print!("\r[{ts}] {arrow} {} {}/{}   ", p.name, p.done, p.total);
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+            }
         }
     }
     clip.request_stop();
@@ -265,6 +271,22 @@ fn run_gui(cfg: nwc_core::config::Config) -> i32 {
                             *tray.shared.balloon.lock().unwrap() = Some((t.clone(), b.clone()));
                             post(tray.hwnd, tray::WM_NOTIFY);
                             log_file.write(&format!("[{ts}] [通知] {t}: {b}"));
+                        }
+                        EngineEvent::Progress(p) => {
+                            // 收尾（done==total）清空进度行还原状态；否则更新进度并刷新托盘
+                            let line = if p.done >= p.total {
+                                None
+                            } else {
+                                let name = std::path::Path::new(&p.name)
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| p.name.clone());
+                                let arrow = if p.up { "↑ 发送" } else { "↓ 接收" };
+                                let pct = if p.total > 0 { p.done * 100 / p.total } else { 100 };
+                                Some(format!("{arrow} {name} {pct}%（{}/{}）", nwc_core::util::fmt_bytes(p.done), nwc_core::util::fmt_bytes(p.total)))
+                            };
+                            *tray.shared.progress.lock().unwrap() = line;
+                            post(tray.hwnd, tray::WM_UPDATE_STATUS);
                         }
                     }
                 }

@@ -27,6 +27,8 @@ pub struct UiState {
     pub paused: bool,
     /// SF Symbol 名（状态图标），随 Status 事件更新
     pub symbol: String,
+    /// 传输进度行（None = 空闲；收尾 done==total 时清空）
+    pub transfer: Option<String>,
 }
 
 struct Ivars {
@@ -202,9 +204,9 @@ define_class! {
 impl NwcMenuController {
     fn refresh(&self, mtm: MainThreadMarker) {
         unsafe {
-            let (status, paused, symbol) = {
+            let (status, paused, symbol, transfer) = {
                 let s = self.ivars().state.lock().unwrap();
-                (s.status.clone(), s.paused, s.symbol.clone())
+                (s.status.clone(), s.paused, s.symbol.clone(), s.transfer.clone())
             };
             if let Some(item) = self.ivars().item.lock().unwrap().as_ref() {
                 if let Some(button) = item.button(mtm) {
@@ -217,12 +219,16 @@ impl NwcMenuController {
                             button.setImage(Some(&img));
                         }
                     }
-                    button.setToolTip(Some(&NSString::from_str(&format!("NetWorkClipboard：{status}"))));
+                    let tip = match &transfer {
+                        Some(t) => format!("NetWorkClipboard：{status}\n{t}"),
+                        None => format!("NetWorkClipboard：{status}"),
+                    };
+                    button.setToolTip(Some(&NSString::from_str(&tip)));
                     button.setTitle(&NSString::from_str(""));
                 }
             }
             if let Some(menu) = self.ivars().menu.lock().unwrap().as_ref() {
-                rebuild_menu(menu, paused, self, mtm);
+                rebuild_menu(menu, paused, transfer, self, mtm);
             }
         }
     }
@@ -238,17 +244,26 @@ unsafe fn represented_text(sender: *mut AnyObject) -> Option<String> {
     Some(s.to_string())
 }
 
-unsafe fn rebuild_menu(menu: &NSMenu, paused: bool, ctrl: &NwcMenuController, mtm: MainThreadMarker) {
+unsafe fn rebuild_menu(
+    menu: &NSMenu,
+    paused: bool,
+    transfer: Option<String>,
+    ctrl: &NwcMenuController,
+    mtm: MainThreadMarker,
+) {
     menu.removeAllItems();
-    let items: Vec<Retained<NSMenuItem>> = vec![
-        disabled_item("NetWorkClipboard", mtm),
-        action_item(
-            if paused { "恢复同步" } else { "暂停同步" },
-            Sel::register(c"togglePause:"),
-            ctrl,
-            mtm,
-        ),
-    ];
+    let mut items: Vec<Retained<NSMenuItem>> = vec![disabled_item("NetWorkClipboard", mtm)];
+    // 传输中把状态行换成进度（完成后由引擎收尾事件清空还原）
+    match &transfer {
+        Some(t) => items.push(disabled_item(t, mtm)),
+        None => {}
+    }
+    items.push(action_item(
+        if paused { "恢复同步" } else { "暂停同步" },
+        Sel::register(c"togglePause:"),
+        ctrl,
+        mtm,
+    ));
     for it in items {
         menu.addItem(&it);
     }
@@ -413,7 +428,12 @@ pub fn run(
             eprintln!("nwc-mac: 无法获取主线程");
             return;
         };
-        let state = Arc::new(Mutex::new(UiState { status: "启动中…".into(), paused: false, symbol: String::new() }));
+        let state = Arc::new(Mutex::new(UiState {
+            status: "启动中…".into(),
+            paused: false,
+            symbol: String::new(),
+            transfer: None,
+        }));
 
         let app = NSApplication::sharedApplication(mtm);
         app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
@@ -438,7 +458,7 @@ pub fn run(
         let button = item.button(mtm).unwrap();
         button.setTitle(&NSString::from_str("NWC…"));
         let menu = NSMenu::new(mtm);
-        rebuild_menu(&menu, false, &ctrl, mtm);
+        rebuild_menu(&menu, false, None, &ctrl, mtm);
         item.setMenu(Some(&menu));
         *ctrl.ivars().menu.lock().unwrap() = Some(menu);
         *ctrl.ivars().item.lock().unwrap() = Some(item);
@@ -468,6 +488,25 @@ pub fn run(
                         EngineEvent::Notify(t, b) => {
                             logger.write(&format!("[{ts}] [通知] {t}: {b}"));
                             show_notification(&t, &b);
+                        }
+                        EngineEvent::Progress(p) => {
+                            // 收尾（done==total）清空进度行还原状态
+                            let line = if p.done >= p.total {
+                                None
+                            } else {
+                                let name = std::path::Path::new(&p.name)
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| p.name.clone());
+                                let arrow = if p.up { "↑ 发送" } else { "↓ 接收" };
+                                let pct = if p.total > 0 { p.done * 100 / p.total } else { 100 };
+                                Some(format!(
+                                    "{arrow} {name} {pct}%（{}/{}）",
+                                    nwc_core::util::fmt_bytes(p.done),
+                                    nwc_core::util::fmt_bytes(p.total)
+                                ))
+                            };
+                            state.lock().unwrap().transfer = line;
                         }
                     }
                 }

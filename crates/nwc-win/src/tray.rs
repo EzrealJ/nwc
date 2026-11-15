@@ -57,6 +57,8 @@ pub struct TrayShared {
     pub paused: Mutex<bool>,
     /// 气泡请求 (标题, 正文)
     pub balloon: Mutex<Option<(String, String)>>,
+    /// 传输进度行（None = 空闲；Some = "↑ 发送 xx 45%（…）"）
+    pub progress: Mutex<Option<String>>,
 }
 
 /// 托盘控制句柄（主线程持有）
@@ -85,6 +87,7 @@ pub fn start_tray(
         tooltip: Mutex::new("NetWorkClipboard：启动中…".into()),
         paused: Mutex::new(false),
         balloon: Mutex::new(None),
+        progress: Mutex::new(None),
     });
     let s2 = Arc::clone(&shared);
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<isize>();
@@ -244,7 +247,11 @@ unsafe fn update_icon(ctx: &mut TrayCtx, hwnd: HWND) {
         return;
     }
     let kind = *ctx.shared.icon_kind.lock().unwrap();
-    let tip = ctx.shared.tooltip.lock().unwrap().clone();
+    let mut tip = ctx.shared.tooltip.lock().unwrap().clone();
+    if let Some(p) = ctx.shared.progress.lock().unwrap().clone() {
+        tip.push_str(" · ");
+        tip.push_str(&p);
+    }
     if let Ok(icon) = make_icon(kind) {
         let old = ctx.nid.hIcon;
         ctx.nid.hIcon = icon;
@@ -293,7 +300,12 @@ unsafe fn show_menu(ctx: &TrayCtx, hwnd: HWND) {
         IconKind::Stopped => "已停止",
     }
     .to_string();
-    append(menu, IDM_STATUS, &format!("{status_text} · {tip}"), MF_STRING | MF_GRAYED);
+    // 传输中首行换成进度（完成后由引擎收尾事件清空还原状态行）
+    let first_line = match ctx.shared.progress.lock().unwrap().clone() {
+        Some(p) => p,
+        None => format!("{status_text} · {tip}"),
+    };
+    append(menu, IDM_STATUS, &first_line, MF_STRING | MF_GRAYED);
     append(menu, 0, "", MF_SEPARATOR);
     append(menu, IDM_PAUSE, if paused { "恢复同步" } else { "暂停同步" }, MF_STRING);
     append(menu, IDM_HISTORY, "历史记录…", MF_STRING);

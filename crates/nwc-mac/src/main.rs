@@ -83,6 +83,12 @@ fn main() {
                 EngineEvent::Warn(m) => println!("[警告] {m}"),
                 EngineEvent::Status(_) => {}
                 EngineEvent::Notify(t, b) => println!("[通知] {t}: {b}"),
+                EngineEvent::Progress(p) => {
+                    let arrow = if p.up { "↑ 发送" } else { "↓ 接收" };
+                    print!("\r{arrow} {} {}/{}   ", p.name, p.done, p.total);
+                    use std::io::Write;
+                    let _ = std::io::stdout().flush();
+                }
             }
         }
     } else {

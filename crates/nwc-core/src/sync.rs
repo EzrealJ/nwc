@@ -77,6 +77,30 @@ pub enum EngineEvent {
     Status(Status),
     /// 气泡通知 (标题, 正文)
     Notify(String, String),
+    /// 分块大文件传输进度（1% 粒度节流，收尾必发 done==total）
+    Progress(TransferProgress),
+}
+
+/// 传输进度：up=发送/接收，name=文件相对路径，done/total=字节
+#[derive(Clone, Debug, PartialEq)]
+pub struct TransferProgress {
+    pub up: bool,
+    pub name: String,
+    pub done: u64,
+    pub total: u64,
+}
+
+/// 1% 粒度节流：跨过新的百分比刻度（含首次）返回 true；total=0 不发
+fn pct_changed(last: &mut i64, done: u64, total: u64) -> bool {
+    if total == 0 {
+        return false;
+    }
+    let pct = ((done.min(total) * 100) / total) as i64;
+    if pct != *last {
+        *last = pct;
+        return true;
+    }
+    false
 }
 
 pub trait ClipboardWriter: Send + Sync {
@@ -150,6 +174,8 @@ struct IncomingFile {
     hasher: Hasher,
     file: std::fs::File,
     tmp: PathBuf,
+    /// 进度节流：上次已发的百分比刻度（-1 = 尚未发过）
+    last_pct: i64,
 }
 
 #[derive(Default)]
@@ -392,6 +418,15 @@ impl Engine {
     }
     fn notify(&self, title: &str, body: impl Into<String>) {
         let _ = self.tx.send(EngineEvent::Notify(title.into(), body.into()));
+    }
+
+    fn emit_progress(&self, up: bool, name: &str, done: u64, total: u64) {
+        let _ = self.tx.send(EngineEvent::Progress(TransferProgress {
+            up,
+            name: name.to_string(),
+            done,
+            total,
+        }));
     }
 
     /// 响应式等待：在等待窗口内持续处理 channel 事件；返回 false 表示收到 Shutdown。
@@ -1218,6 +1253,7 @@ impl Engine {
         };
         let mut chunk: Vec<u8> = Vec::with_capacity(CHUNK_SIZE);
         let mut seq: u64 = 0;
+        let mut last_pct: i64 = -1;
         loop {
             chunk.clear();
             let mut take = CHUNK_SIZE;
@@ -1251,6 +1287,10 @@ impl Engine {
                 return false;
             }
             seq += 1;
+            let done = (seq as usize * CHUNK_SIZE).min(f.size as usize) as u64;
+            if last || pct_changed(&mut last_pct, done, f.size) {
+                self.emit_progress(true, &f.rel, done, f.size);
+            }
             if last {
                 break;
             }
@@ -1741,12 +1781,14 @@ impl Engine {
                             hasher: Hasher::new(),
                             file: f,
                             tmp,
+                            last_pct: -1,
                         },
                     );
                 }
                 Err(_) => return,
             }
         }
+        let rel_for_progress = rel.clone();
         let Some(inc) = self.incoming.get_mut(&key) else { return };
         if inc.file.write_all(payload).is_err() {
             return;
@@ -1754,6 +1796,14 @@ impl Engine {
         inc.hasher.update(payload);
         inc.written += payload.len() as u64;
         if !last {
+            if segs.len() == 1 {
+                let (done, total) = (inc.written, inc.size);
+                let mut last_pct = inc.last_pct;
+                if pct_changed(&mut last_pct, done, total) {
+                    inc.last_pct = last_pct;
+                    self.emit_progress(false, &rel_for_progress, done, total);
+                }
+            }
             return;
         }
         // 最后一块：校验哈希并落位
@@ -1794,6 +1844,10 @@ impl Engine {
             let _ = std::fs::remove_file(&inc.tmp);
             self.warn(format!("落盘失败: {rel}"));
             return;
+        }
+        // 收尾必发：done == total（顶层单文件才有 UI 进度语义，子树文件不发）
+        if segs.len() == 1 {
+            self.emit_progress(false, &rel, inc.written, inc.size);
         }
         let b = self.batches.get_mut(&batch_id).unwrap();
         if segs.len() > 1 {
@@ -2242,8 +2296,7 @@ mod tests {
 
     /// resolve_file_dest 纯函数：覆盖 / 幂等 / 可选避让三种分支
     #[test]
-    fn resolve_dest_overwrite_and_optin_rename() {
-        let dir = std::env::temp_dir().join(format!("nwc-rfd-{}", std::process::id()));
+    fn resolve_dest_overwrite_and_optin_rename() {        let dir = std::env::temp_dir().join(format!("nwc-rfd-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.txt"), b"old").unwrap();
@@ -2371,6 +2424,82 @@ mod tests {
         e.handle_cmd(EngineCmd::PasteImage(dir.join("ghost.png").to_string_lossy().into_owned()));
         assert_eq!(e.history.len(), 1);
         assert_eq!(w.0.lock().unwrap().0.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 进度节流纯函数：跨过新百分比刻度才发；total=0 不发；done 超 total 钳到 100%
+    #[test]
+    fn pct_throttle() {
+        let mut last = -1i64;
+        assert!(pct_changed(&mut last, 0, 400), "首次必发");
+        assert!(!pct_changed(&mut last, 1, 400), "同刻度内不重复发");
+        assert!(!pct_changed(&mut last, 3, 400));
+        assert!(pct_changed(&mut last, 4, 400), "1% = 4B，跨过 1% 刻度");
+        assert!(pct_changed(&mut last, 400, 400), "100% 收尾");
+        assert_eq!(last, 100);
+
+        let mut z = -1i64;
+        assert!(!pct_changed(&mut z, 0, 0), "total=0 不发");
+
+        let mut c = -1i64;
+        assert!(pct_changed(&mut c, 500, 400));
+        assert_eq!(c, 100, "done 超限钳到 100%");
+    }
+
+    /// 接收分块文件：进度事件 1% 粒度 + 收尾必发（done==total），只对顶层单文件
+    #[test]
+    fn chunked_receive_emits_progress() {
+        use std::sync::Arc;
+        let dir = std::env::temp_dir().join(format!("nwc-prog-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut cfg = crate::config::Config::default();
+        cfg.state_dir = dir.join("state");
+        cfg.inbox_dir = dir.join("inbox");
+        cfg.inbox_keep_days = 0;
+
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (evt_tx, evt_rx) = std::sync::mpsc::channel();
+        let mut e = Engine::new(cfg, Arc::new(NoopW), Arc::new(Vec::new), cmd_rx, evt_tx);
+        e.set_cmd_sender(cmd_tx);
+
+        // 400 字节文件分 4 块（每块 100B → 每块跨 25%）
+        let chunk: Vec<u8> = (0..100).collect();
+        let mut full = Vec::new();
+        for i in 0..4u8 {
+            full.extend(chunk.iter().map(|b| b + i));
+        }
+        let sha = crate::util::sha256_hex(&full);
+        for seq in 0..4u64 {
+            let mut payload = chunk.clone();
+            for b in payload.iter_mut() {
+                *b += seq as u8;
+            }
+            let hdr = serde_json::json!({
+                "t": "fileChunk", "rel": "big.bin", "size": 400u64, "sha256": sha,
+                "seq": seq, "last": u8::from(seq == 3), "ri": 0, "batchId": "b1", "count": 1,
+            });
+            e.handle_cmd(EngineCmd::PeerBin(hdr, payload));
+        }
+        // 批次收尾，保证批次不悬挂
+        e.handle_cmd(EngineCmd::PeerBin(serde_json::json!({"t": "batchEnd", "batchId": "b1"}), Vec::new()));
+
+        let mut prog: Vec<TransferProgress> = Vec::new();
+        while let Ok(ev) = evt_rx.try_recv() {
+            if let EngineEvent::Progress(p) = ev {
+                prog.push(p);
+            }
+        }
+        assert!(!prog.is_empty(), "应有进度事件");
+        assert!(prog.iter().all(|p| !p.up && p.name == "big.bin" && p.total == 400));
+        // done 单调递增，最后一条收尾 done==total
+        assert!(prog.windows(2).all(|w| w[0].done < w[1].done), "done 应严格递增: {prog:?}");
+        let fin = prog.last().unwrap();
+        assert_eq!((fin.done, fin.total), (400, 400), "收尾必发 done==total");
+        // 4 块各跨 25%：4 个刻度（0/25/50/75/100 中每块命中一个新刻度），恰 4 条
+        assert_eq!(prog.len(), 4, "1% 粒度节流: {prog:?}");
+        // 落盘正确
+        assert_eq!(std::fs::read(dir.join("inbox").join("big.bin")).unwrap(), full);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
