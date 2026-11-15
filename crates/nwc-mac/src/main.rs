@@ -6,6 +6,8 @@
 #[cfg(target_os = "macos")]
 mod adapters;
 #[cfg(target_os = "macos")]
+mod history_win;
+#[cfg(target_os = "macos")]
 mod autostart;
 #[cfg(target_os = "macos")]
 mod pasteboard;

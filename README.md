@@ -51,7 +51,7 @@ nwc --help         # 全部参数
 - 配置文件：`~/.networkclipboard/config.json`——两端均有「设置…」对话框（口令/端口/设备名/角色/收件箱目录/历史开关与条数/收件箱保留天数/同名文件覆盖；**合并写**，保留手写的其它键），保存后自动重启生效；「编辑配置文件…」留作高级用途
 - 收件箱默认 `~/NetWorkClipboard/inbox`——**它是文件中转缓存而非归档存储**：同名文件一律覆盖原名（latest-wins，文件名保持稳定；内容相同则幂等跳过）；若希望同名不同内容时保留副本，设置里取消「同名文件直接覆盖」（或 config.json 写 `inboxRenameOnConflict: true`，恢复 `名字 (N).ext` 后缀避让）。自动按保留天数清理（默认 14 天，`inboxKeepDays` 配置，`0` 关闭；启动与每批次接收后触发），也可在菜单「清空收件箱…」手动清理；日志在 `~/.networkclipboard/logs/`（按天滚动、保留 7 天，两端 GUI 模式均落盘）
 - 托盘/菜单栏菜单：暂停/恢复同步、历史记录、打开收件箱、打开日志、设置/编辑配置、开机自启（Windows 写 HKCU 注册表无 UAC；macOS 用 LaunchAgent）、退出
-- 历史记录：Windows 是独立窗口（顶部搜索框实时过滤、双击粘贴、可删单条）；macOS 在菜单栏子菜单里（点击粘贴、**按住 Option 点击删除该条**）。默认保留 20 条（`~/.networkclipboard/history.json`），可在 config.json 用 `historyEnabled` / `historyLimit` 调整
+- 历史记录：两端均有独立历史窗口（顶部搜索框实时过滤、双击粘贴、可删单条/清空；文本/图片重新复制并同步对端，文件打开所在位置）；macOS 菜单栏子菜单另保留最近 5 条快捷入口（点击粘贴、**按住 Option 点击删除该条**）。默认保留 20 条（`~/.networkclipboard/history.json`），可在 config.json 用 `historyEnabled` / `historyLimit` 调整
 - macOS 菜单栏为 SF Symbol 状态图标（连接/扫描/暂停等），悬停显示状态文字
 - 排查问题：两端看 `~/.networkclipboard/logs/` 当天日志；图片/文件没同步时，日志会记录剪贴板实际格式列表与转码失败原因
 

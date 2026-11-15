@@ -102,6 +102,14 @@ define_class! {
             let _ = self.ivars().cmd_tx.send(EngineCmd::ClearHistory);
         }
 
+        /// 打开历史记录独立窗口（搜索/双击粘贴/删除/清空）
+        #[unsafe(method(openHistoryWindow:))]
+        unsafe fn open_history_window(&self, _sender: *mut AnyObject) {
+            let Some(mtm) = objc2::MainThreadMarker::new() else { return };
+            let iv = self.ivars();
+            crate::history_win::open_history(mtm, iv.cmd_tx.clone(), iv.state_dir.clone());
+        }
+
         /// 配对：点击已知对端条目设为优先设备
         #[unsafe(method(setPeerPref:))]
         unsafe fn set_peer_pref(&self, sender: *mut AnyObject) {
@@ -313,11 +321,16 @@ unsafe fn append_peers_submenu(menu: &NSMenu, ctrl: &NwcMenuController, mtm: Mai
 unsafe fn append_history_submenu(menu: &NSMenu, ctrl: &NwcMenuController, mtm: MainThreadMarker) {
     let entries = nwc_core::history::load(&ctrl.ivars().state_dir);
     let sub = NSMenu::new(mtm);
+    // 独立历史窗口（搜索/双击粘贴/删除/清空）快捷入口
+    let win_item = action_item("打开历史窗口…", Sel::register(c"openHistoryWindow:"), ctrl, mtm);
+    sub.addItem(&win_item);
+    sub.addItem(&separator(mtm));
     if entries.is_empty() {
         let it = disabled_item("（暂无记录）", mtm);
         sub.addItem(&it);
     } else {
-        for e in &entries {
+        // 子菜单只保留最近 5 条快捷入口，完整管理在历史窗口
+        for e in entries.iter().take(5) {
             let one_line: String = e.text.chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
             let title: String = one_line.chars().take(60).collect();
             // 类型分发：文本=重新粘贴；图片=重新复制（PasteImage）；文件=Finder 显示
