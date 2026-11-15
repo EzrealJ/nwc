@@ -1,101 +1,97 @@
 # NetWorkClipboard (nwc)
 
-局域网剪贴板同步小工具（Rust）：**托盘常驻 + 原生剪贴板 + 加密传输**。
-Windows 端单个 ~2MB exe、私有内存 ~2MB；macOS 端单进程、剪贴板轮询零子进程（仅通知/打开文件等偶发动作调用系统命令）；无需安装任何运行时。
+> 同一局域网内，两台电脑共享同一块剪贴板。
 
-## 下载
+[![CI](https://github.com/EzrealJ/nwc/actions/workflows/ci.yml/badge.svg)](https://github.com/EzrealJ/nwc/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/EzrealJ/nwc)](https://github.com/EzrealJ/nwc/releases)
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-blue)
 
-从 [Releases](https://github.com/EzrealJ/nwc/releases) 获取：
-
-| 文件 | 平台 | 说明 |
-|---|---|---|
-| `NetWorkClipboard-v*-win-x64.zip` | Windows 10+ x64 | 解压即用 `nwc.exe` |
-| `NetWorkClipboard-v*-macos-arm64-app.zip` | macOS（Apple Silicon） | **推荐**：解压得 `NetWorkClipboard.app`，双击即用 |
-| `NetWorkClipboard-v*-macos-x64-app.zip` | macOS（Intel） | 同上 |
-| `NetWorkClipboard-v*-macos-arm64.zip` / `-x64.zip` | macOS | 裸二进制，终端调试用（不要给裸文件加 `.app` 后缀，那不是合法 bundle） |
-
-> macOS 版未签名/未公证：首次打开需右键 →「打开」，或先执行 `xattr -cr NetWorkClipboard.app` 去除隔离属性。
+局域网剪贴板同步工具：在 Windows 上复制文字、截图或文件，macOS 上直接粘贴，反之亦然。托盘/菜单栏常驻，纯原生实现，无任何运行时依赖——Windows 单 exe 约 2MB、macOS 单进程，私有内存约 2MB。
 
 ## 特性
 
-- 两端共享同一口令，scrypt 派生密钥 + AES-256-GCM 加密传输
-- 局域网自动发现对端，手动 `--target` 指定亦可
-- **已知对端与配对**：每次成功握手自动登记设备（`peers.json`）；菜单「已知对端」可选择配对设备——默认优先连接它（IP 漂移按设备 ID 识别），开启「仅与配对设备同步」后非配对设备一律拒绝（多台设备共用口令时防止剪贴板流向错误机器）
-- 大文件 256KB 分块流式传输（能力自动协商，内存占用恒定）
-- 剪贴板图片双向同步：Windows 端 PNG + CF_DIBV5 双格式写入、DIB（24/32bpp）自动转码；macOS 端 TIFF + PNG + PNGf 三格式写入，各类粘贴目标都能识别
-- 剪贴板历史（默认 20 条，重启保留）：**文本 / 图片 / 文件三种类型**统一记录（图片以 PNG 落盘 `~/.networkclipboard/history/`，超过 5MB 不进历史；文件记录收件箱路径），条目带类型标识，支持搜索；Windows 窗口双击条目 / macOS 菜单栏点击条目即可重新复制并同步对端（文件条目则打开所在位置）
-- 收到文件时托盘气泡 / 系统通知提示，**点击通知直达收件箱**（Windows 气泡点击 / macOS 通知点击，均自动打开收件箱目录）；收件箱自动按天清理（中转缓存语义，默认保留 14 天）
-- 大文件传输有**进度反馈**：托盘/菜单栏悬停提示与菜单首行实时显示「↑/↓ 文件名 45%（已传/总量）」，完成后自动还原
-- 单实例保护（Windows 命名互斥量 / macOS flock），双开自动拦截
-- 自动过滤 198.18.0.0/15（Clash/Mihomo 等 fake-IP TUN 网段，避免误判对端）
-- 两端文件日志（`~/.networkclipboard/logs/`，按天滚动保留 7 天），剪贴板内容识别失败时自动记录格式诊断信息
+- **端到端加密** — scrypt 派生密钥 + AES-256-GCM，局域网上无明文
+- **零配置起步** — 自动发现对端，两端口令一致即通；也支持手动指定
+- **文字 / 图片 / 文件** — 大文件 256KB 分块流式传输，内存占用恒定
+- **设备配对** — 可只与指定设备同步，公共局域网里防误传
+- **剪贴板历史** — 文字/图片/文件三类型统一记录，可搜索，双击重新复制
+- **收件箱中转** — 同名文件原位覆盖（文件名永远稳定），按天自动清理不膨胀
+- **可靠传输** — 换网自愈、断线补发、回声抑制（不会同步给自己）
+- **体验细节** — 传输进度实时显示，收文件点通知直达收件箱
 
-## 结构
+## 快速开始
 
-```
-├── crates/
-│   ├── nwc-core/    # 纯逻辑（两端共享）：协议帧、加密、传输、发现、回声抑制、同步引擎、配置
-│   ├── nwc-win/     # Windows 壳：托盘(Win32)、剪贴板(WM_CLIPBOARDUPDATE 事件驱动)、设置对话框、开机自启、文件日志
-│   └── nwc-mac/     # macOS 壳：菜单栏(NSStatusItem)、NSPasteboard、getifaddrs、LaunchAgent
-```
+从 [Releases](https://github.com/EzrealJ/nwc/releases) 下载：
+
+| 文件 | 平台 | 说明 |
+|---|---|---|
+| `NetWorkClipboard-v*-win-x64.zip` | Windows 10+ | 解压即用 `nwc.exe` |
+| `NetWorkClipboard-v*-macos-arm64-app.zip` | macOS (Apple Silicon) | **推荐**，解压得 `.app`，双击即用 |
+| `NetWorkClipboard-v*-macos-x64-app.zip` | macOS (Intel) | 同上 |
+| `*-macos-*.zip`（不带 `-app`） | macOS | 裸二进制，终端调试用 |
+
+1. 两端各装一份，启动后从菜单打开「设置…」，**口令设成一样**即可自动连上
+2. macOS 未做公证：首次打开需右键 →「打开」，或 `xattr -cr NetWorkClipboard.app`
 
 ## 使用
 
 ```
-nwc                # 托盘/菜单栏模式（默认）：状态图标 + 右键菜单
-nwc --cli          # 控制台模式（日志直出，调试/双实例用）
-nwc --help         # 全部参数
+nwc            # 托盘/菜单栏模式（默认）
+nwc --cli      # 控制台模式（日志直出，调试用）
 ```
 
-（macOS 上二进制名为 `nwc-mac`）
+托盘/菜单栏菜单：暂停同步、历史记录、打开收件箱、已知对端（配对）、设置、开机自启。
 
-- 配置文件：`~/.networkclipboard/config.json`——两端均有「设置…」对话框（口令/端口/设备名/角色/收件箱目录/历史开关与条数/收件箱保留天数/同名文件覆盖；**合并写**，保留手写的其它键），保存后自动重启生效；「编辑配置文件…」留作高级用途
-- 收件箱默认 `~/NetWorkClipboard/inbox`——**它是文件中转缓存而非归档存储**：同名文件一律覆盖原名（latest-wins，文件名保持稳定；内容相同则幂等跳过）；若希望同名不同内容时保留副本，设置里取消「同名文件直接覆盖」（或 config.json 写 `inboxRenameOnConflict: true`，恢复 `名字 (N).ext` 后缀避让）。自动按保留天数清理（默认 14 天，`inboxKeepDays` 配置，`0` 关闭；启动与每批次接收后触发），也可在菜单「清空收件箱…」手动清理；日志在 `~/.networkclipboard/logs/`（按天滚动、保留 7 天，两端 GUI 模式均落盘）
-- 托盘/菜单栏菜单：暂停/恢复同步、历史记录、打开收件箱、打开日志、设置/编辑配置、开机自启（Windows 写 HKCU 注册表无 UAC；macOS 用 LaunchAgent）、退出
-- 历史记录：两端均有独立历史窗口（顶部搜索框实时过滤、双击粘贴、可删单条/清空；文本/图片重新复制并同步对端，文件打开所在位置）；macOS 菜单栏子菜单另保留最近 5 条快捷入口（点击粘贴、**按住 Option 点击删除该条**）。默认保留 20 条（`~/.networkclipboard/history.json`），可在 config.json 用 `historyEnabled` / `historyLimit` 调整
-- macOS 菜单栏为 SF Symbol 状态图标（连接/扫描/暂停等），悬停显示状态文字
-- 排查问题：两端看 `~/.networkclipboard/logs/` 当天日志；图片/文件没同步时，日志会记录剪贴板实际格式列表与转码失败原因
+配置文件 `~/.networkclipboard/config.json`，两端设置窗口已覆盖常用项（合并写，保存自动重启）：
+
+| 配置项 | 默认 | 说明 |
+|---|---|---|
+| `token` | — | 共享口令，两端必须一致 |
+| `port` | `8767` | 监听/连接端口 |
+| `name` | 主机名 | 对端显示的设备名 |
+| `role` | `auto` | `auto` / `server`（只监听）/ `client`（只连接） |
+| `inboxDir` | `~/NetWorkClipboard/inbox` | 收件目录（中转缓存，非归档） |
+| `inboxKeepDays` | `14` | 收件保留天数，`0` 关闭自动清理 |
+| `inboxRenameOnConflict` | `false` | 同名文件冲突时保留副本改名（默认原位覆盖） |
+| `historyEnabled` / `historyLimit` | `true` / `20` | 剪贴板历史开关与条数上限 |
 
 ## 构建
 
-需要 Rust stable（rustup 安装，MSVC 或 GNU 工具链均可）。
+需要 Rust stable（rustup 安装，MSVC 或 GNU 工具链均可）：
 
 ```bash
-# Windows（生成 target/release/nwc.exe）
-cargo build --release -p nwc-win
-
-# macOS（生成 target/release/nwc-mac）
-cargo build --release -p nwc-mac
-
-# macOS 上交叉编译 Windows 版（需先 brew install mingw-w64）
-rustup target add x86_64-pc-windows-gnu
-cargo build --release -p nwc-win --target x86_64-pc-windows-gnu
+cargo build --release -p nwc-mac                                  # macOS
+cargo build --release -p nwc-win --target x86_64-pc-windows-gnu   # Windows 交叉编译
+scripts/package.sh                                                # 本地打包（产物进 dist/）
 ```
 
-> Windows GNU 工具链注意：`windows` crate 固定在 0.57（0.58+ 经 windows-link 走 raw-dylib，在 windows-gnu 上需要 dlltool 且与 rlib 复用有符号冲突）；如用 GNU 工具链需保证 `dlltool.exe`/`as.exe` 可用（rustup self-contained 目录或 WinLibs）。
-
-发布：推 `v*` 标签（或在 Actions 页手动触发 `release` 工作流）自动构建三端产物并发 Release；macOS 产物包含裸二进制与 `.app` bundle 两种。
-
-本地打包：构建后运行 `scripts/package.sh [TAG]`，与 CI 打包步骤一致（macOS 必出 `.app`，产物进 `dist/`，含 zip 校验与陈旧产物防护）；详细规则见 `AGENTS.md`。
+> Windows 交叉编译需 `rustup target add x86_64-pc-windows-gnu` + `brew install mingw-w64`；`windows` crate 固定在 0.57（0.58+ 在 windows-gnu 下有符号冲突，勿盲目升级）。
 
 ## 测试
 
 ```bash
-cargo test -p nwc-core                          # 平台无关单元测试 + 双引擎回环/端到端（任意系统）
-cargo test -p nwc-win -- --test-threads=1       # Windows 剪贴板真机测试（需在 Windows 上）
-cargo test -p nwc-mac -- --test-threads=1       # macOS NSPasteboard 真机测试（需在 macOS 上）
+cargo test -p nwc-core                     # 单元 + 双引擎端到端（任意平台）
+cargo test -p nwc-mac -- --test-threads=1  # macOS 真机（真实剪贴板读写）
+cargo test -p nwc-win -- --test-threads=1  # Windows 真机
 ```
 
-测试金字塔（CI 自动执行，见 `.github/workflows/ci.yml`）：
+测试金字塔（CI 全矩阵执行）：单元（协议/加密/引擎/配置）→ 平台真机（剪贴板读写往返）→ 端到端（双引擎经真实 TCP 互发，字节级断言一致）。
 
-| 层 | 内容 | 跑在哪 |
-|---|---|---|
-| 单元 | DIB 编解码 / 协议 / 加密 / 同步引擎 / 配置（含平台 cfg 分支） | Linux（win/mac 复跑锁定分支行为） |
-| 平台真机 | 剪贴板读写往返（win：PNG+DIBV5 双格式；mac：TIFF/PNG/PNGf、NSURL↔NSFilenames） | windows / macos runner 实机 |
-| 端到端 | 双引擎经真实 TCP 互发文本/图片，断言对端写入字节级一致 | Linux |
+## 排查
 
-CI 触发已收敛（PR 全矩阵；main 仅代码变更时跑；纯文档不触发），发版工作流在出产物前会先跑完同一套测试。
+- **日志**：`~/.networkclipboard/logs/`，按天滚动保留 7 天；图片/文件未同步时日志会记录剪贴板实际格式与失败原因
+- **连不上**：检查两端口令、系统防火墙、是否被 AP 隔离；工具会自动过滤虚拟网卡与 Clash fake-IP 网段（198.18.0.0/15）
+- **粘贴不出图片**：工具在两端写入多种格式（Windows PNG+DIBV5，macOS TIFF+PNG），个别应用只认特定格式时请带日志反馈
+- **重复内容不同步**：10 秒内复制相同内容会被回声抑制吞掉，属预期行为
 
-## 资源占用（Windows 实测）
+## 结构
 
-单进程，私有内存 1.8MB（工作集 10.5MB，含系统 DLL 共享页），单文件 2.1MB。
+纯逻辑与平台壳分离，`nwc-core` 两端共享：
+
+| crate | 职责 |
+|---|---|
+| `nwc-core` | 协议帧、加密、发现、传输、同步引擎、配置（平台无关，含全部测试） |
+| `nwc-win` | Windows 壳：托盘、剪贴板（事件驱动）、设置对话框、开机自启 |
+| `nwc-mac` | macOS 壳：菜单栏、NSPasteboard、LaunchAgent、历史/设置窗口 |
+
+开发约定见 [AGENTS.md](AGENTS.md)。
