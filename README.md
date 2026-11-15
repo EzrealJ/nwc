@@ -76,6 +76,8 @@ cargo build --release -p nwc-win --target x86_64-pc-windows-gnu
 
 发布：推 `v*` 标签（或在 Actions 页手动触发 `release` 工作流）自动构建三端产物并发 Release；macOS 产物包含裸二进制与 `.app` bundle 两种。
 
+本地打包：构建后运行 `scripts/package.sh [TAG]`，与 CI 打包步骤一致（macOS 必出 `.app`，产物进 `dist/`，含 zip 校验与陈旧产物防护）；详细规则见 `AGENTS.md`。
+
 ## 测试
 
 ```bash
