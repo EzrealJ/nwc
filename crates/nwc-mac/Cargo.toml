@@ -15,6 +15,8 @@ objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSStatusItem", "NSMenu", "NSPasteboard", "NSImage", "NSRunningApplication", "NSWorkspace", "NSEvent", "NSWindow", "NSView", "NSButton", "NSTextField", "NSPopUpButton", "NSControl", "NSAlert", "NSScrollView", "NSSearchField", "NSTableView", "NSTableColumn", "NSResponder", "NSText"] }
 objc2-foundation = { version = "0.3", features = ["NSString", "NSArray", "NSURL", "NSPathUtilities", "NSNotification", "NSThread"] }
 libc = "0.2"
+objc2-user-notifications = "0.3.2"
+block2 = "0.6"
 
 [dependencies.serde_json]
 version = "1"

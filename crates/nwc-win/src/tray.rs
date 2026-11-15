@@ -11,7 +11,8 @@ use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
-    ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NOTIFYICONDATAW,
+    ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO,
+    NIN_BALLOONUSERCLICK, NOTIFYICONDATAW,
     NIM_ADD, NIM_DELETE, NIM_MODIFY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -182,6 +183,8 @@ unsafe extern "system" fn tray_wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 // lParam 是鼠标事件
                 match lp.0 as u32 {
                     WM_RBUTTONUP | WM_CONTEXTMENU | WM_RBUTTONDBLCLK => show_menu(ctx, hwnd),
+                    // 气泡通知点击：直达收件箱（定位刚收到的内容）
+                    NIN_BALLOONUSERCLICK => open_path(&ctx.inbox_dir.to_string_lossy()),
                     WM_LBUTTONUP => {} // 左键：预留（可扩展为打开状态面板）
                     _ => {}
                 }

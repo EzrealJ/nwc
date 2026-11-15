@@ -15,6 +15,7 @@ use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSEvent, NSEventModifierFlags, NSImage, NSMenu,
     NSMenuItem, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
 };
+use objc2_user_notifications::{UNMutableNotificationContent, UNNotificationRequest, UNUserNotificationCenter};
 use objc2_foundation::{NSString, NSTimer, NSRunLoop, NSDefaultRunLoopMode};
 
 use nwc_core::sync::{EngineCmd, EngineEvent, Status};
@@ -29,6 +30,9 @@ pub struct UiState {
     pub symbol: String,
     /// 传输进度行（None = 空闲；收尾 done==total 时清空）
     pub transfer: Option<String>,
+    /// 待展示通知 (标题, 正文)：事件泵线程写入，主线程 tick 取走展示
+    /// （NSUserNotification 只能在主线程操作，泵线程不能碰 AppKit）
+    pub notify: Option<(String, String)>,
 }
 
 struct Ivars {
@@ -54,6 +58,26 @@ define_class! {
         unsafe fn tick(&self, _timer: *mut AnyObject) {
             let Some(mtm) = MainThreadMarker::new() else { return };
             self.refresh(mtm);
+            self.flush_notify(mtm);
+        }
+
+        /// 通知点击 → 打开收件箱（UNUserNotificationCenter delegate，
+        /// AppKit 运行时动态调用；delegate 经 msg_send 挂接）
+        #[unsafe(method(userNotificationCenter:didReceiveNotificationResponse:withCompletionHandler:))]
+        unsafe fn nc_response(
+            &self,
+            _center: *mut AnyObject,
+            _response: *mut AnyObject,
+            handler: *mut AnyObject,
+        ) {
+            let dir = self.ivars().inbox.clone();
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::process::Command::new("open").arg(&dir).spawn();
+            // 必须调用 completion Block 标记处理完成（block 布局保证 invoke 可直接调用）
+            if !handler.is_null() {
+                let block = &*(handler as *const block2::Block<dyn Fn()>);
+                block.call(());
+            }
         }
 
         #[unsafe(method(togglePause:))]
@@ -232,6 +256,34 @@ impl NwcMenuController {
             }
         }
     }
+
+    /// 展示待发通知：UNUserNotificationCenter（可点击直达收件箱）；
+    /// 裸二进制（无 bundle）拿不到通知中心，退回 osascript
+    fn flush_notify(&self, mtm: MainThreadMarker) {
+        let pending = self.ivars().state.lock().unwrap().notify.take();
+        let Some((title, body)) = pending else { return };
+        unsafe {
+            // currentNotificationCenter 对无 bundle 应用返回 nil，typed 绑定会断言非空，故走 raw
+            let center: *mut AnyObject =
+                msg_send![UNUserNotificationCenter::class(), currentNotificationCenter];
+            if center.is_null() {
+                show_notification_osascript(&title, &body);
+                return;
+            }
+            let content: Retained<UNMutableNotificationContent> =
+                msg_send![mtm.alloc::<UNMutableNotificationContent>(), init];
+            content.setTitle(&NSString::from_str(&title));
+            content.setBody(&NSString::from_str(&body));
+            let ident = NSString::from_str("nwc-inbox-notify");
+            let req: Retained<UNNotificationRequest> = msg_send![
+                UNNotificationRequest::class(),
+                requestWithIdentifier: &*ident,
+                content: &*content,
+                trigger: Option::<&AnyObject>::None,
+            ];
+            let _: () = msg_send![center, addNotificationRequest: &*req, completionHandler: Option::<&AnyObject>::None];
+        }
+    }
 }
 
 /// 菜单项 representedObject 里存的完整历史文本
@@ -402,7 +454,7 @@ unsafe fn action_item(title: &str, action: Sel, ctrl: &NwcMenuController, mtm: M
 
 /// 系统通知（通知中心）。nwc 无 bundle 签名，UNUserNotification 走不通，
 /// 用 osascript display notification（仅通知时偶发一次子进程，常驻路径仍零子进程）
-fn show_notification(title: &str, body: &str) {
+fn show_notification_osascript(title: &str, body: &str) {
     let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
     let script = format!("display notification \"{}\" with title \"{}\"", esc(body), esc(title));
     let _ = std::process::Command::new("osascript")
@@ -433,6 +485,7 @@ pub fn run(
             paused: false,
             symbol: String::new(),
             transfer: None,
+            notify: None,
         }));
 
         let app = NSApplication::sharedApplication(mtm);
@@ -463,6 +516,21 @@ pub fn run(
         *ctrl.ivars().menu.lock().unwrap() = Some(menu);
         *ctrl.ivars().item.lock().unwrap() = Some(item);
 
+        // 通知点击 → 收件箱：控制器挂为通知中心 delegate（点击回调动态分发）；
+        // 首次运行请求授权（badge|sound|alert=7），拒绝只影响通知显示，不影响功能
+        unsafe {
+            let center: *mut AnyObject =
+                msg_send![UNUserNotificationCenter::class(), currentNotificationCenter];
+            if !center.is_null() {
+                let _: () = msg_send![center, setDelegate: as_any(&*ctrl)];
+                let _: () = msg_send![
+                    center,
+                    requestAuthorizationWithOptions: 7u64,
+                    completionHandler: Option::<&AnyObject>::None
+                ];
+            }
+        }
+
         // 引擎事件：状态 → 共享状态；日志/警告 → 文件；通知 → 系统通知中心 + 文件
         std::thread::Builder::new()
             .name("nwc-evt-pump".into())
@@ -487,7 +555,8 @@ pub fn run(
                         }
                         EngineEvent::Notify(t, b) => {
                             logger.write(&format!("[{ts}] [通知] {t}: {b}"));
-                            show_notification(&t, &b);
+                            // NSUserNotification 只能主线程操作：入队，tick 取走展示
+                            state.lock().unwrap().notify = Some((t, b));
                         }
                         EngineEvent::Progress(p) => {
                             // 收尾（done==total）清空进度行还原状态
