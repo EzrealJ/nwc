@@ -276,8 +276,9 @@ fn resolve_rel(rel: &str) -> Vec<String> {
 
 /// 接收文件的落位规则：不存在 → 原名；已存在且内容哈希一致 → 幂等覆盖
 /// （收件箱语义：同一文件永远占一份，刷新 mtime 配合按天清理）；
-/// 已存在但内容不同 → 后缀避让（绝不覆盖不同内容）。
-fn resolve_file_dest(dir: &Path, name: &str, incoming_sha: &str) -> PathBuf {
+/// 已存在但内容不同 → 默认覆盖原名（latest-wins，文件名稳定），
+/// rename_on_conflict = true 时退回后缀避让「名字 (N).ext」（旧版防覆盖行为）。
+fn resolve_file_dest(dir: &Path, name: &str, incoming_sha: &str, rename_on_conflict: bool) -> PathBuf {
     let p = dir.join(name);
     if !p.exists() {
         return p;
@@ -285,7 +286,10 @@ fn resolve_file_dest(dir: &Path, name: &str, incoming_sha: &str) -> PathBuf {
     if stream_hash(&p).as_deref() == Some(incoming_sha) {
         return p;
     }
-    // 异内容：扫描后缀序列，同内容副本幂等覆盖，否则在序列尾部追加
+    if !rename_on_conflict {
+        return p; // 异内容同名 → 覆盖（收件箱是中转缓存，最新版本为准）
+    }
+    // 异内容（避让模式）：扫描后缀序列，同内容副本幂等覆盖，否则在序列尾部追加
     let stem = Path::new(name).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     let ext = Path::new(name).extension().map(|s| format!(".{}", s.to_string_lossy())).unwrap_or_default();
     for i in 1..u32::MAX {
@@ -1587,11 +1591,12 @@ impl Engine {
         }
     }
 
-    /// 解析接收目标路径（ensureRoot + 幂等/避让语义；同哈希覆盖、异内容后缀、子树同样规则）
+    /// 解析接收目标路径（ensureRoot + 幂等/覆盖语义；同哈希幂等、异内容默认覆盖，
+    /// inbox_rename_on_conflict 时后缀避让；子树内文件同规则）
     fn dest_for(&mut self, batch_id: &str, header: &Value, segs: &[String], is_dir: bool, incoming_sha: &str) -> Option<PathBuf> {
         if segs.len() == 1 && !is_dir {
             std::fs::create_dir_all(&self.cfg.inbox_dir).ok()?;
-            return Some(resolve_file_dest(&self.cfg.inbox_dir, &segs[0], incoming_sha));
+            return Some(resolve_file_dest(&self.cfg.inbox_dir, &segs[0], incoming_sha, self.cfg.inbox_rename_on_conflict));
         }
         let key = root_key_of(header, segs);
         let name = segs[0].clone();
@@ -1614,8 +1619,12 @@ impl Engine {
         }
         let root = b.roots.get(&key)?;
         let direct = root.dest.join(segs[1..].iter().collect::<PathBuf>());
-        // 子树内文件与顶层同规则：同内容覆盖、异内容同级后缀避让
-        let dest = if is_dir || !direct.exists() || stream_hash(&direct).as_deref() == Some(incoming_sha) {
+        // 子树内文件与顶层同规则：同内容幂等覆盖、异内容默认覆盖，开避让时同级后缀避让
+        let dest = if is_dir
+            || !direct.exists()
+            || stream_hash(&direct).as_deref() == Some(incoming_sha)
+            || !self.cfg.inbox_rename_on_conflict
+        {
             direct
         } else {
             let parent = direct.parent()?;
@@ -2050,7 +2059,7 @@ mod tests {
         v
     }
 
-    /// 接收幂等语义：同内容重复接收不产生 (N) 副本；同名异内容才后缀避让
+    /// 接收落位语义（默认）：同名一律覆盖（latest-wins，文件名保持稳定）；同内容重复接收幂等
     #[test]
     fn incoming_file_idempotent_landing() {
         use std::sync::Arc;
@@ -2081,13 +2090,80 @@ mod tests {
         send(&mut e, "dup.txt", b"aaa", "b2");
         assert_eq!(inbox_entries(&inbox), vec!["dup.txt".to_string()], "同内容重复接收不应产生副本");
 
-        // 内容改为 bbb 再来：异内容 → 后缀避让，两份共存
+        // 内容改为 bbb 再来：同名 → 覆盖（latest-wins），文件名保持稳定
         send(&mut e, "dup.txt", b"bbb", "b3");
-        assert_eq!(inbox_entries(&inbox), vec!["dup (1).txt".to_string(), "dup.txt".to_string()], "同名异内容应后缀避让");
+        assert_eq!(inbox_entries(&inbox), vec!["dup.txt".to_string()], "同名异内容应覆盖原文件而非改名");
+        assert_eq!(std::fs::read(inbox.join("dup.txt")).unwrap(), b"bbb", "覆盖后应为新内容");
 
-        // 再传一次 bbb 内容：与 dup (1).txt 幂等，不产生第三份
+        // 再传一次 bbb：幂等，仍只有一份
         send(&mut e, "dup.txt", b"bbb", "b4");
+        assert_eq!(inbox_entries(&inbox), vec!["dup.txt".to_string()], "与现有内容相同应幂等");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 旧防覆盖行为保留为可选项：inboxRenameOnConflict = true 时同名异内容后缀避让
+    #[test]
+    fn incoming_file_rename_on_conflict_optin() {
+        use std::sync::Arc;
+        let dir = std::env::temp_dir().join(format!("nwc-rename-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut cfg = crate::config::Config::default();
+        cfg.state_dir = dir.join("state");
+        cfg.inbox_dir = dir.join("inbox");
+        cfg.inbox_keep_days = 0;
+        cfg.inbox_rename_on_conflict = true;
+
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (evt_tx, _evt) = std::sync::mpsc::channel();
+        let mut e = Engine::new(cfg, Arc::new(NoopW), Arc::new(Vec::new), cmd_rx, evt_tx);
+        e.set_cmd_sender(cmd_tx);
+
+        let send = |e: &mut Engine, rel: &str, payload: &[u8], batch: &str| {
+            let hdr = serde_json::json!({
+                "t": "file", "rel": rel, "size": payload.len(),
+                "sha256": crate::util::sha256_hex(payload),
+                "index": 1, "count": 1, "ri": 0, "batchId": batch,
+            });
+            e.handle_cmd(EngineCmd::PeerBin(hdr, payload.to_vec()));
+        };
+
+        let inbox = dir.join("inbox");
+        send(&mut e, "dup.txt", b"aaa", "b1");
+        send(&mut e, "dup.txt", b"bbb", "b2");
+        assert_eq!(
+            inbox_entries(&inbox),
+            vec!["dup (1).txt".to_string(), "dup.txt".to_string()],
+            "开启避让后同名异内容应后缀避让，两份共存"
+        );
+        assert_eq!(std::fs::read(inbox.join("dup.txt")).unwrap(), b"aaa", "原文件应保留旧内容");
+        assert_eq!(std::fs::read(inbox.join("dup (1).txt")).unwrap(), b"bbb", "新内容应落在避让名下");
+
+        // 同内容再来一次：与避让副本幂等，不产生第三份
+        send(&mut e, "dup.txt", b"bbb", "b3");
         assert_eq!(inbox_entries(&inbox).len(), 2, "与既有副本同内容应幂等覆盖");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// resolve_file_dest 纯函数：覆盖 / 幂等 / 可选避让三种分支
+    #[test]
+    fn resolve_dest_overwrite_and_optin_rename() {
+        let dir = std::env::temp_dir().join(format!("nwc-rfd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), b"old").unwrap();
+        let sha_old = crate::util::sha256_hex(b"old");
+        let sha_new = crate::util::sha256_hex(b"new");
+
+        // 不存在 → 原名
+        assert_eq!(resolve_file_dest(&dir, "b.txt", &sha_new, false), dir.join("b.txt"));
+        // 已存在且同内容 → 原名（幂等覆盖）
+        assert_eq!(resolve_file_dest(&dir, "a.txt", &sha_old, false), dir.join("a.txt"));
+        // 已存在异内容 + 默认（rename=false）→ 原名覆盖
+        assert_eq!(resolve_file_dest(&dir, "a.txt", &sha_new, false), dir.join("a.txt"));
+        // 已存在异内容 + 开启避让 → 后缀序列首空位
+        assert_eq!(resolve_file_dest(&dir, "a.txt", &sha_new, true), dir.join("a (1).txt"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

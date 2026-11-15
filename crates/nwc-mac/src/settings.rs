@@ -41,6 +41,7 @@ struct Ivars {
     history_on: Retained<objc2_app_kit::NSButton>,
     history_limit: Retained<objc2_app_kit::NSTextField>,
     inbox_days: Retained<objc2_app_kit::NSTextField>,
+    inbox_rename: Retained<objc2_app_kit::NSButton>,
 }
 
 define_class! {
@@ -89,8 +90,10 @@ define_class! {
                 }
             };
             let history_on = iv.history_on.state() == NSOnState;
+            // 复选框文案是「覆盖」：勾选 = 覆盖 = rename_on_conflict 为 false
+            let inbox_rename = iv.inbox_rename.state() != NSOnState;
 
-            if let Err(e) = save_merged(&iv.cfg_path, token, port, name, role, inbox, history_on, history_limit, inbox_days) {
+            if let Err(e) = save_merged(&iv.cfg_path, token, port, name, role, inbox, history_on, history_limit, inbox_days, inbox_rename) {
                 alert(&format!("写入失败：{e}"));
                 return;
             }
@@ -132,7 +135,7 @@ pub fn open_settings(mtm: MainThreadMarker, cfg_path: PathBuf) {
         let window: Retained<NSWindow> = unsafe {
             msg_send![
                 mtm.alloc::<NSWindow>(),
-                initWithContentRect: rect(0.0, 0.0, CW, 470.0),
+                initWithContentRect: rect(0.0, 0.0, CW, 506.0),
                 styleMask: style,
                 backing: NSBackingStoreType::Buffered,
                 defer: false,
@@ -233,6 +236,17 @@ pub fn open_settings(mtm: MainThreadMarker, cfg_path: PathBuf) {
         place(as_obj(&*history_limit), PAD, y, 100.0, EDIT_H);
         let inbox_days = edit(mtm, &cur.inbox_days);
         place(as_obj(&*inbox_days), x2, y, 100.0, EDIT_H);
+        y += EDIT_H + ROW_GAP;
+
+        // ── 收件箱同名冲突策略 ──
+        let inbox_rename = objc2_app_kit::NSButton::checkboxWithTitle_target_action(
+            &NSString::from_str("同名文件直接覆盖（取消勾选则保留副本并改名）"),
+            None,
+            None,
+            mtm,
+        );
+        inbox_rename.setState(if !cur.inbox_rename { NSOnState } else { NSOffState });
+        place(as_obj(&*inbox_rename), PAD, y, full, EDIT_H);
         y += EDIT_H + BLOCK_GAP + 6.0;
 
         // ── 按钮 ──
@@ -249,6 +263,7 @@ pub fn open_settings(mtm: MainThreadMarker, cfg_path: PathBuf) {
                 history_on,
                 history_limit,
                 inbox_days,
+                inbox_rename,
             });
             msg_send![super(alloc), init]
         };
@@ -310,6 +325,7 @@ struct CurCfg {
     history_on: bool,
     history_limit: String,
     inbox_days: String,
+    inbox_rename: bool,
 }
 
 fn read_current(cfg_path: &std::path::Path) -> CurCfg {
@@ -323,6 +339,7 @@ fn read_current(cfg_path: &std::path::Path) -> CurCfg {
         history_on: d.history_enabled,
         history_limit: d.history_limit.to_string(),
         inbox_days: d.inbox_keep_days.to_string(),
+        inbox_rename: d.inbox_rename_on_conflict,
     };
     if let Ok(text) = std::fs::read_to_string(cfg_path) {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
@@ -334,6 +351,7 @@ fn read_current(cfg_path: &std::path::Path) -> CurCfg {
             if let Some(b) = v["historyEnabled"].as_bool() { cur.history_on = b; }
             if let Some(n) = v["historyLimit"].as_u64() { cur.history_limit = n.to_string(); }
             if let Some(n) = v["inboxKeepDays"].as_u64() { cur.inbox_days = n.to_string(); }
+            if let Some(b) = v["inboxRenameOnConflict"].as_bool() { cur.inbox_rename = b; }
         }
     }
     cur
@@ -350,6 +368,7 @@ fn save_merged(
     history_on: bool,
     history_limit: u64,
     inbox_days: u64,
+    inbox_rename: bool,
 ) -> Result<(), String> {
     if let Some(dir) = cfg_path.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -371,6 +390,7 @@ fn save_merged(
     obj.insert("historyEnabled".into(), serde_json::json!(history_on));
     obj.insert("historyLimit".into(), serde_json::json!(history_limit));
     obj.insert("inboxKeepDays".into(), serde_json::json!(inbox_days));
+    obj.insert("inboxRenameOnConflict".into(), serde_json::json!(inbox_rename));
     let text = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
     std::fs::write(cfg_path, text + "\n").map_err(|e| e.to_string())
 }

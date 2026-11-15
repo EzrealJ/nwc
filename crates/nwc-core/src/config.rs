@@ -43,6 +43,9 @@ pub struct Config {
     pub history_limit: u64,
     /// 收件箱自动清理：保留天数（收件箱是中转缓存而非归档；0 = 关闭自动清理）
     pub inbox_keep_days: u64,
+    /// 收件箱同名冲突策略：false（默认）= 覆盖原名文件（latest-wins，文件名稳定）；
+    /// true = 后缀避让「名字 (N).ext」（旧版防覆盖行为）
+    pub inbox_rename_on_conflict: bool,
     pub state_dir: PathBuf,
     pub inbox_dir: PathBuf,
     // 运行时状态
@@ -79,6 +82,7 @@ impl Default for Config {
             history_enabled: true,
             history_limit: 20,
             inbox_keep_days: 14,
+            inbox_rename_on_conflict: false,
             state_dir: home.join(".networkclipboard"),
             inbox_dir: home.join("NetWorkClipboard").join("inbox"),
             peer_hint: String::new(),
@@ -402,6 +406,9 @@ fn apply(cfg: &mut Config, v: &JsonV) {
     }
     if let Some(v) = u64_of(get("inboxKeepDays")) {
         cfg.inbox_keep_days = v.min(3650);
+    }
+    if let Some(v) = get("inboxRenameOnConflict").and_then(JsonV::as_bool) {
+        cfg.inbox_rename_on_conflict = v;
     }
     if let Some(d) = get("inboxDir").and_then(JsonV::as_str) {
         if !d.is_empty() {

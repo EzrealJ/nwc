@@ -19,14 +19,15 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, MessageBoxW, MoveWindow,
     AdjustWindowRectEx, PostQuitMessage, RegisterClassW, SendMessageW, SetForegroundWindow, ShowWindow,
     TranslateMessage,
+    BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX,
     CW_USEDEFAULT, HMENU, MSG, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW,
     WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_SETFONT,
     WNDCLASSW, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
 };
 
-/// 客户区尺寸：宽度 400；高度由布局推出（内容底 312 + 底边距 20）
+/// 客户区尺寸：宽度 400；高度由布局推出（内容底 344 + 底边距 20）
 const CW: i32 = 400;
-const CH: i32 = 332;
+const CH: i32 = 364;
 /// 统一边距与行高
 const PAD: i32 = 20;
 const LABEL_H: i32 = 18;
@@ -39,6 +40,7 @@ const IDC_PORT: i32 = 1102;
 const IDC_NAME: i32 = 1103;
 const IDC_ROLE: i32 = 1104;
 const IDC_INBOX: i32 = 1105;
+const IDC_INBOX_OVERWRITE: i32 = 1106;
 const IDC_SAVE: i32 = 1201;
 const IDC_CANCEL: i32 = 1202;
 
@@ -207,6 +209,25 @@ unsafe fn button(parent: HWND, id: i32, text: &str, x: i32, y: i32, wd: i32, ht:
     apply_font(b);
 }
 
+unsafe fn checkbox(parent: HWND, id: i32, text: &str, x: i32, y: i32, wd: i32) {
+    let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let b = CreateWindowExW(
+        WINDOW_EX_STYLE(0),
+        w!("BUTTON"),
+        PCWSTR(wide.as_ptr()),
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_AUTOCHECKBOX as u32),
+        x,
+        y,
+        wd,
+        EDIT_H,
+        Some(&parent),
+        HMENU(id as isize),
+        None,
+        None,
+    );
+    apply_font(b);
+}
+
 fn create_controls(hwnd: HWND) {
     unsafe {
         let cfg = read_current_cfg();
@@ -240,6 +261,12 @@ fn create_controls(hwnd: HWND) {
         label(hwnd, "收件箱目录", PAD, y + 3, full);
         y += LABEL_H + ROW_GAP;
         edit(hwnd, IDC_INBOX, &cfg.4, PAD, y, full);
+        y += EDIT_H + ROW_GAP;
+
+        // ── 收件箱同名冲突策略 ──
+        // 复选框文案是「覆盖」：勾选 = 覆盖 = rename_on_conflict 为 false
+        checkbox(hwnd, IDC_INBOX_OVERWRITE, "同名文件直接覆盖（取消勾选则保留副本并改名）", PAD, y, full);
+        set_check(hwnd, IDC_INBOX_OVERWRITE, !cfg.5);
         y += EDIT_H + BLOCK_GAP + 6;
 
         // ── 按钮行 ──
@@ -251,7 +278,7 @@ fn create_controls(hwnd: HWND) {
 
 // ---- 读写 ----
 
-fn read_current_cfg() -> (String, String, String, String, String) {
+fn read_current_cfg() -> (String, String, String, String, String, bool) {
     let path = CFG_PATH.with(|c| c.borrow().clone()).unwrap_or_else(default_cfg_path);
     let mut token = String::new();
     let mut port = "8767".into();
@@ -262,6 +289,7 @@ fn read_current_cfg() -> (String, String, String, String, String) {
         .join("inbox")
         .to_string_lossy()
         .into_owned();
+    let mut inbox_rename = false; // 默认覆盖（latest-wins）
     if let Ok(text) = std::fs::read_to_string(&path) {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
             if let Some(s) = v["token"].as_str() {
@@ -279,9 +307,12 @@ fn read_current_cfg() -> (String, String, String, String, String) {
             if let Some(s) = v["inboxDir"].as_str() {
                 inbox = s.into();
             }
+            if let Some(b) = v["inboxRenameOnConflict"].as_bool() {
+                inbox_rename = b;
+            }
         }
     }
-    (token, port, name, role, inbox)
+    (token, port, name, role, inbox, inbox_rename)
 }
 
 fn default_cfg_path() -> PathBuf {
@@ -296,6 +327,16 @@ unsafe fn get_text(hwnd: HWND, id: i32) -> String {
     let mut buf = vec![0u16; (len + 1) as usize];
     let n = GetWindowTextW(ctl, &mut buf);
     String::from_utf16_lossy(&buf[..n.max(0) as usize])
+}
+
+// BM_SETCHECK/BM_GETCHECK 的检查态即 BST_UNCHECKED=0 / BST_CHECKED=1
+unsafe fn set_check(hwnd: HWND, id: i32, checked: bool) {
+    let ctl = GetDlgItem(hwnd, id);
+    let _ = SendMessageW(ctl, BM_SETCHECK, WPARAM(checked as usize), LPARAM(0));
+}
+
+unsafe fn is_checked(hwnd: HWND, id: i32) -> bool {
+    SendMessageW(GetDlgItem(hwnd, id), BM_GETCHECK, WPARAM(0), LPARAM(0)).0 == 1
 }
 
 fn on_save(hwnd: HWND) {
@@ -339,6 +380,9 @@ fn on_save(hwnd: HWND) {
             } else {
                 obj.insert("inboxDir".into(), serde_json::json!(inbox));
             }
+            // 复选框文案是「覆盖」：勾选 = 覆盖 = rename_on_conflict 为 false
+            let overwrite = is_checked(hwnd, IDC_INBOX_OVERWRITE);
+            obj.insert("inboxRenameOnConflict".into(), serde_json::json!(!overwrite));
         }
         let text = serde_json::to_string_pretty(&v).unwrap_or_default();
         if std::fs::write(&path, text + "\n").is_err() {
