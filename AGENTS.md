@@ -5,7 +5,7 @@
 
 ## 构建与打包（硬规则）
 
-1. **macOS 产物必须打 `.app` bundle，不能只交裸二进制**。统一用 `scripts/package.sh`（与 CI 打包步骤逐行一致），交付物是 `dist/NetWorkClipboard-v*-macos-<arch>-app.zip`（Finder 双击即用）；裸二进制 zip 仅作终端调试附带。
+1. **macOS 产物必须打 `.app` bundle，不能只交裸二进制**。统一用 `scripts/package.sh`（产物与 CI 一致），交付物是 `dist/NetWorkClipboard-v*-macos-<arch>-app.zip`（Finder 双击即用）；裸二进制 zip 仅作终端调试附带。
 2. Windows 产物交 `dist/NetWorkClipboard-v*-win-x64.zip`（`nwc.exe`，解压即用）。
 3. 本地打包流程 = 先构建后打包，两步分开跑（脚本只打包，不隐藏构建错误）：
    ```bash

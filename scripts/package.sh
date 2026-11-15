@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# 本地打包脚本：与 .github/workflows/release.yml 的打包步骤逐行一致。
+# 本地打包脚本：产物与 .github/workflows/release.yml 一致（mac 打包步骤同源；
+# Windows zip 在 CI 走 Compress-Archive、本地走 bsdtar，格式等价）。
 #
 # 用法（先自行完成构建，本脚本只做打包，不隐藏构建错误）：
 #   cargo build --release -p nwc-mac                                # macOS（本机架构）
