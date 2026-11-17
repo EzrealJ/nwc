@@ -73,10 +73,10 @@ define_class! {
             let dir = self.ivars().inbox.clone();
             let _ = std::fs::create_dir_all(&dir);
             let _ = std::process::Command::new("open").arg(&dir).spawn();
-            // 必须调用 completion Block 标记处理完成（block 布局保证 invoke 可直接调用）
+            // completion handler 签名 void (^)(NSError *)：必须调用一次标记处理完成
             if !handler.is_null() {
-                let block = &*(handler as *const block2::Block<dyn Fn()>);
-                block.call(());
+                let block = &*(handler as *const block2::Block<dyn Fn(*mut objc2_foundation::NSError)>);
+                block.call(std::ptr::null_mut());
             }
         }
 
@@ -281,7 +281,9 @@ impl NwcMenuController {
                 content: &*content,
                 trigger: Option::<&AnyObject>::None,
             ];
-            let _: () = msg_send![center, addNotificationRequest: &*req, completionHandler: Option::<&AnyObject>::None];
+            // selector 必须是 addNotificationRequest:withCompletionHandler:（completionHandler:
+            // 是不存在的方法，会抛 unrecognized selector——v0.4.0 的闪退根因）
+            let _: () = msg_send![center, addNotificationRequest: &*req, withCompletionHandler: Option::<&AnyObject>::None];
         }
     }
 }
@@ -517,16 +519,19 @@ pub fn run(
         *ctrl.ivars().item.lock().unwrap() = Some(item);
 
         // 通知点击 → 收件箱：控制器挂为通知中心 delegate（点击回调动态分发）；
-        // 首次运行请求授权（badge|sound|alert=7），拒绝只影响通知显示，不影响功能
+        // 首次运行请求授权（badge|sound|alert=7），拒绝只影响通知显示，不影响功能。
+        // 注意 completionHandler 在 ObjC 头文件中为 nonnull，必须传真 Block
         unsafe {
             let center: *mut AnyObject =
                 msg_send![UNUserNotificationCenter::class(), currentNotificationCenter];
             if !center.is_null() {
                 let _: () = msg_send![center, setDelegate: as_any(&*ctrl)];
+                let auth_done =
+                    block2::RcBlock::new(move |_granted: objc2::ffi::Bool, _err: *mut objc2_foundation::NSError| {});
                 let _: () = msg_send![
                     center,
                     requestAuthorizationWithOptions: 7u64,
-                    completionHandler: Option::<&AnyObject>::None
+                    completionHandler: &*auth_done
                 ];
             }
         }
