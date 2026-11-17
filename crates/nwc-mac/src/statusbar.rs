@@ -76,7 +76,7 @@ define_class! {
             // completion handler 签名 void (^)(NSError *)：必须调用一次标记处理完成
             if !handler.is_null() {
                 let block = &*(handler as *const block2::Block<dyn Fn(*mut objc2_foundation::NSError)>);
-                block.call(std::ptr::null_mut());
+                block.call((std::ptr::null_mut(),));
             }
         }
 
@@ -527,7 +527,7 @@ pub fn run(
             if !center.is_null() {
                 let _: () = msg_send![center, setDelegate: as_any(&*ctrl)];
                 let auth_done =
-                    block2::RcBlock::new(move |_granted: objc2::ffi::Bool, _err: *mut objc2_foundation::NSError| {});
+                    block2::RcBlock::new(move |_granted: objc2::runtime::Bool, _err: *mut objc2_foundation::NSError| {});
                 let _: () = msg_send![
                     center,
                     requestAuthorizationWithOptions: 7u64,

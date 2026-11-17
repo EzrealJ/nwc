@@ -26,15 +26,15 @@ ARCH_VER="${TAG#v}"
 
 mkdir -p dist
 
-# 陈旧产物防护：二进制 mtime 必须晚于最近一次源码变更，否则拒绝打包
-# （防旧版本残留混进新版本产物——target/ 里的历史构建会被 cargo 复用）
-newest_src=$(find crates Cargo.toml Cargo.lock -type f -newer /dev/null 2>/dev/null | xargs stat -f '%m %N' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f1)
-check_fresh() { # $1 = 二进制路径
+# 陈旧产物防护：二进制 mtime 早于最近一次源码变更 → 跳过该产物并警告
+# （防旧版本残留混进新版本产物；只构建部分平台时其它残留不阻塞本地产物）
+newest_src=$(find crates Cargo.toml Cargo.lock -type f -print0 2>/dev/null | xargs -0 stat -f '%m %N' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f1)
+check_fresh() { # $1 = 二进制路径；陈旧返回 1
     local bin_mtime
     bin_mtime=$(stat -f '%m' "$1")
-    if [ "$bin_mtime" -lt "$newest_src" ]; then
-        echo "错误：$1 是陈旧构建（早于最近一次源码变更），请先重新构建再打包" >&2
-        exit 1
+    if [ -z "$newest_src" ] || [ "$bin_mtime" -lt "$newest_src" ]; then
+        echo "警告：跳过陈旧构建 $1（早于最近一次源码变更，请重新构建）" >&2
+        return 1
     fi
 }
 
@@ -42,7 +42,7 @@ check_fresh() { # $1 = 二进制路径
 package_mac() { # $1 = 产物目录前缀, $2 = arch 名
     local bin_dir="$1" arch="$2"
     [ -x "$bin_dir/nwc-mac" ] || return 1
-    check_fresh "$bin_dir/nwc-mac"
+    check_fresh "$bin_dir/nwc-mac" || return 1
     tar -a -cf "dist/NetWorkClipboard-$TAG-macos-$arch.zip" -C "$bin_dir" nwc-mac
     # .app bundle（Finder 双击即用；裸二进制仅适合终端调试）
     local APP="NetWorkClipboard.app"
@@ -76,13 +76,12 @@ if [ -x "target/aarch64-apple-darwin/release/nwc-mac" ]; then
     package_mac "target/aarch64-apple-darwin/release" arm64
 fi
 if [ -x "target/x86_64-apple-darwin/release/nwc-mac" ]; then
-    package_mac "target/x86_64-apple-darwin/release" x64
+    package_mac "target/x86_64-apple-darwin/release" x64 || true
 fi
-package_mac "target/release" "$(uname -m | sed 's/arm64/arm64/;s/x86_64/x64/')"
+package_mac "target/release" "$(uname -m | sed 's/arm64/arm64/;s/x86_64/x64/')" || true
 
 # ---- Windows：交叉编译产物 ----
-if [ -x "target/x86_64-pc-windows-gnu/release/nwc.exe" ]; then
-    check_fresh "target/x86_64-pc-windows-gnu/release/nwc.exe"
+if [ -x "target/x86_64-pc-windows-gnu/release/nwc.exe" ] && check_fresh "target/x86_64-pc-windows-gnu/release/nwc.exe"; then
     tar -a -cf "dist/NetWorkClipboard-$TAG-win-x64.zip" -C target/x86_64-pc-windows-gnu/release nwc.exe
 fi
 
