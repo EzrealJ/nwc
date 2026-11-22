@@ -470,7 +470,7 @@ pub fn run(
     evt_rx: Receiver<EngineEvent>,
     inbox: PathBuf,
     cfg_path: PathBuf,
-    logger: nwc_core::logger::FileLogger,
+    logger: std::sync::Arc<nwc_core::logger::FileLogger>,
     log_path: PathBuf,
 ) {
     static STARTED: AtomicBool = AtomicBool::new(false);

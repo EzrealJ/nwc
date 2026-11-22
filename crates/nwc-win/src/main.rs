@@ -229,8 +229,10 @@ fn status_label(s: &Status) -> String {
 /// 托盘模式：文件日志 + 托盘 + 状态/气泡转发
 #[cfg(windows)]
 fn run_gui(cfg: nwc_core::config::Config) -> i32 {
-    let log_file = nwc_core::logger::FileLogger::new(&cfg.state_dir);
+    let log_file = std::sync::Arc::new(nwc_core::logger::FileLogger::new(&cfg.state_dir));
     log_file.prune(7);
+    // GUI 子系统无 stderr：panic 不落盘就是静默闪退、永无现场
+    nwc_core::logger::install_panic_hook(std::sync::Arc::clone(&log_file));
 
     let cfg_path = cfg.state_dir.join("config.json");
     let state_dir = cfg.state_dir.clone();

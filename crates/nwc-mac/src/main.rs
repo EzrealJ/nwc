@@ -106,8 +106,9 @@ fn main() {
             }
         }
         // 菜单栏模式（主线程跑 AppKit）：GUI 无控制台，日志落文件（按天滚动、保留 7 天）
-        let logger = nwc_core::logger::FileLogger::new(&state_dir);
+        let logger = std::sync::Arc::new(nwc_core::logger::FileLogger::new(&state_dir));
         logger.prune(7);
+        nwc_core::logger::install_panic_hook(std::sync::Arc::clone(&logger));
         let log_path = logger.latest_path();
         statusbar::run(cmd_tx, evt_rx, inbox_dir, cfg_path, logger, log_path);
     }

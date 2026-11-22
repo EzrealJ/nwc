@@ -77,7 +77,17 @@ pub fn dib_to_png(dib: &[u8]) -> Option<Vec<u8>> {
     let bpp = rd16(dib, 14)? as usize;
     let compression = rd32(dib, 16)?;
     let clr_used = rd32(dib, 32)?.min(256) as usize;
-    if planes != 1 || (bpp != 24 && bpp != 32) || (compression != 0 && compression != 3) || width == 0 || height == 0 {
+    // 尺寸钳制：真实剪贴板图片远小于此；畸形头（width/height 可达 2^31）会让
+    // stride*need 等乘法在 release 下回绕、绕过下方大小校验后越界读 → 崩溃
+    const MAX_DIM: usize = 32 * 1024;
+    if planes != 1
+        || (bpp != 24 && bpp != 32)
+        || (compression != 0 && compression != 3)
+        || width == 0
+        || height == 0
+        || width > MAX_DIM
+        || height > MAX_DIM
+    {
         return None;
     }
     // 掩码：BI_BITFIELDS 时 V4/V5 头在头内 40..52；40 字节 INFO 头则跟在头后（40/44/48）
